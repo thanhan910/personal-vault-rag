@@ -12,6 +12,7 @@ services:
     user: "${PVR_UID:-1000}:${PVR_GID:-1000}"
     volumes:
       - ${PVR_DATA_DIR:?set PVR_DATA_DIR}:/data
+      - ./dist/windows:/downloads:ro
     ports:
       - "127.0.0.1:${PVR_BIND_PORT:-5001}:5001"
     depends_on:

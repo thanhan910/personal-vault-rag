@@ -2,7 +2,7 @@
 
 Open the private Vault URL from a tailnet device. Paste the administrator token from the ignored data directory into the browser login; it stays in browser local storage. The readiness cards show lexical search immediately and semantic/visual/rerank readiness only after configuration.
 
-To connect Windows, select **Generate pairing code**, download/extract the Windows package, run `install.ps1`, enter the private Vault URL and code, then choose source folders and a Saved Artifacts destination. The token is DPAPI-protected for that Windows user. Network/cloud placeholders are read only when Windows can hydrate them; unavailable items remain reported rather than deleted.
+To connect Windows, use **Download Windows connector** and **Create pairing code** on the private page, extract the ZIP, run `install.ps1`, enter the private Vault URL and code, then choose source folders and a Saved Artifacts destination. The token is DPAPI-protected for that Windows user. Network/cloud placeholders are read only when Windows can hydrate them; unavailable items remain reported rather than deleted. The same page provides the Claude Desktop extension.
 
 Enter a Voyage key only in **Provider settings** and set an explicit monthly USD allowance. The initial import may use text embedding at the provider's current per-token rate and visual embedding by processed pixels; actual content determines cost. The local ledger reserves before a call. Start with a small allowance and inspect usage rather than estimating the whole corpus by paid scanning.
 

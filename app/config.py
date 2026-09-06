@@ -10,6 +10,7 @@ class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_prefix="PVR_", case_sensitive=False)
 
     data_dir: Path = Path("/data")
+    download_dir: Path = Path("/downloads")
     bind_port: int = 5001
     public_base_url: str = "http://127.0.0.1:5001/vault"
     remote_base_url: str = "http://127.0.0.1:5001/vault-mcp"

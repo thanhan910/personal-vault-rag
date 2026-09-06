@@ -29,6 +29,8 @@ def test_setup_pair_and_vault_authentication():
         assert claim.status_code == 200 and claim.json()["vault_id"] == setup.json()["vault_id"]
         assert client.get("/api/status", headers={"Authorization": f"Bearer {claim.json()['access_token']}"}).status_code == 200
         assert client.get("/api/status", headers={"Authorization": "Bearer wrong"}).status_code == 401
+        assert client.get("/api/downloads/windows-connector").status_code == 401
+        assert client.get("/api/downloads/not-a-package", headers=headers).status_code == 404
         assert client.get("/api/health").json()["status"] == "ok"
         metadata = client.get("/.well-known/oauth-authorization-server").json()
         assert metadata["code_challenge_methods_supported"] == ["S256"]

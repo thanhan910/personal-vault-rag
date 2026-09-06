@@ -78,6 +78,22 @@ def index() -> FileResponse:
     return FileResponse(Path(__file__).parent / "static" / "index.html", headers={"Cache-Control": "no-store", "X-Robots-Tag": "noindex, nofollow"})
 
 
+@app.get("/api/downloads/{artifact}")
+def download_artifact(artifact: str, principal: Principal = Depends(require_principal)) -> FileResponse:
+    principal.require("admin")
+    files = {
+        "windows-connector": ("personal-vault-connector-windows-amd64.zip", "application/zip"),
+        "claude-extension": ("personal-vault-claude-windows.mcpb", "application/zip"),
+    }
+    item = files.get(artifact)
+    if not item:
+        raise HTTPException(404, "Unknown download")
+    path = settings().download_dir / item[0]
+    if not path.is_file():
+        raise HTTPException(503, "Package has not been built on this host")
+    return FileResponse(path, media_type=item[1], filename=item[0], headers={"Cache-Control": "no-store"})
+
+
 class SetupRequest(BaseModel):
     name: str = Field(min_length=1, max_length=100)
 
