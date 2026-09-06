@@ -1,0 +1,98 @@
+name: personal-vault-rag
+
+services:
+  api:
+    build:
+      context: .
+    image: personal-vault-rag:0.1.0
+    command: ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "5001", "--proxy-headers", "--forwarded-allow-ips", "*"]
+    env_file: .env
+    environment:
+      PVR_DATA_DIR: /data
+    user: "${PVR_UID:-1000}:${PVR_GID:-1000}"
+    volumes:
+      - ${PVR_DATA_DIR:?set PVR_DATA_DIR}:/data
+    ports:
+      - "127.0.0.1:${PVR_BIND_PORT:-5001}:5001"
+    depends_on:
+      qdrant:
+        condition: service_healthy
+    restart: unless-stopped
+    read_only: true
+    tmpfs:
+      - /tmp:size=256m,mode=1777
+    security_opt:
+      - no-new-privileges:true
+    cap_drop: [ALL]
+    mem_limit: 768m
+    cpus: 1.0
+    pids_limit: 256
+    logging:
+      driver: local
+      options:
+        max-size: 10m
+        max-file: "3"
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:5001/api/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+
+  worker:
+    image: personal-vault-rag:0.1.0
+    command: ["python", "-m", "app.worker"]
+    env_file: .env
+    environment:
+      PVR_DATA_DIR: /data
+      OMP_NUM_THREADS: "2"
+    user: "${PVR_UID:-1000}:${PVR_GID:-1000}"
+    volumes:
+      - ${PVR_DATA_DIR:?set PVR_DATA_DIR}:/data
+    depends_on:
+      api:
+        condition: service_healthy
+    restart: unless-stopped
+    read_only: true
+    tmpfs:
+      - /tmp:size=512m,mode=1777
+    security_opt:
+      - no-new-privileges:true
+    cap_drop: [ALL]
+    mem_limit: 3g
+    cpus: 2.0
+    pids_limit: 512
+    logging:
+      driver: local
+      options:
+        max-size: 20m
+        max-file: "3"
+    healthcheck:
+      disable: true
+
+  qdrant:
+    image: qdrant/qdrant:v1.18.2
+    user: "${PVR_UID:-1000}:${PVR_GID:-1000}"
+    volumes:
+      - ${PVR_DATA_DIR:?set PVR_DATA_DIR}/qdrant:/qdrant/storage
+      - ${PVR_DATA_DIR:?set PVR_DATA_DIR}/qdrant-snapshots:/qdrant/snapshots
+    restart: unless-stopped
+    tmpfs:
+      - /tmp:size=64m,mode=1777
+    security_opt:
+      - no-new-privileges:true
+    cap_drop: [ALL]
+    mem_limit: 2g
+    cpus: 1.0
+    pids_limit: 256
+    logging:
+      driver: local
+      options:
+        max-size: 10m
+        max-file: "3"
+    healthcheck:
+      test: ["CMD-SHELL", "bash -c 'exec 3<>/dev/tcp/127.0.0.1/6333; printf \"GET /healthz HTTP/1.0\\r\\n\\r\\n\" >&3; grep -q \"200 OK\" <&3'"]
+      interval: 20s
+      timeout: 5s
+      retries: 5
+      start_period: 20s

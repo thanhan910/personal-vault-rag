@@ -1,0 +1,5 @@
+# Validation
+
+`scripts/vaultctl verify` checks Compose configuration, API/Qdrant health, automated vault/security/catalogue/extraction tests, package manifests and Windows checksums. `scripts/evaluate.py` generates a disposable English/Vietnamese corpus with exact IDs, paraphrasable facts, conflicting dates, a multi-document programme, XLSX cells, DOCX, PPTX, a scanned image/PDF, synthesized speech and a short video. It ingests through the real HTTP/worker path and checks retrieval IDs/locators, abstention and bounded spreadsheet arithmetic.
+
+Keep live measurements in [PROGRESS.md](PROGRESS.md). Passing this small synthetic corpus proves exercised paths, not universal accuracy, tens-of-thousands scale, Windows behavior or paid-provider quality. Linux cross-compilation validates a Windows PE build and package shape only. DPAPI, folder picking, Task Scheduler, cloud hydration, Claude UI installation, ChatGPT account OAuth and subscription-model answers require their actual clients and must be reported separately.

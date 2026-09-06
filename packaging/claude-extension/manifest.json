@@ -1,0 +1,28 @@
+{
+  "manifest_version": "0.3",
+  "name": "personal-vault",
+  "display_name": "Personal Vault",
+  "version": "0.1.0",
+  "description": "Search and save notes to a paired personal document vault.",
+  "long_description": "Uses the Personal Vault Connector configuration already paired on this Windows account. Search results include stable document and revision IDs with precise evidence locators.",
+  "author": {"name": "Personal Vault project"},
+  "server": {
+    "type": "binary",
+    "entry_point": "server/personal-vault-connector.exe",
+    "mcp_config": {
+      "command": "${__dirname}/server/personal-vault-connector.exe",
+      "args": ["mcp-stdio"],
+      "env": {}
+    }
+  },
+  "tools": [
+    {"name": "search_vault", "description": "Hybrid-search the personal vault."},
+    {"name": "fetch_evidence", "description": "Expand a result with adjacent evidence."},
+    {"name": "inspect_visual", "description": "Inspect one retained document, image, or video preview."},
+    {"name": "calculate_spreadsheet", "description": "Calculate over persisted cells with a cited range."},
+    {"name": "collection_status", "description": "Show collection readiness and source availability."},
+    {"name": "save_chat_note", "description": "Explicitly save a user-authored note to the configured source destination."}
+  ],
+  "compatibility": {"claude_desktop": ">=0.10.0", "platforms": ["win32"]},
+  "keywords": ["search", "documents", "retrieval", "personal knowledge"]
+}

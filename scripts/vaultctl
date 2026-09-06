@@ -1,0 +1,65 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+repo_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
+cd "$repo_dir"
+
+command=${1:-status}
+case "$command" in
+  deploy)
+    exec "$repo_dir/scripts/deploy.sh"
+    ;;
+  status)
+    docker compose ps
+    curl -fsS http://127.0.0.1:${PVR_BIND_PORT:-5001}/api/health
+    ;;
+  health)
+    curl -fsS http://127.0.0.1:${PVR_BIND_PORT:-5001}/api/health
+    ;;
+  verify)
+    exec "$repo_dir/scripts/verify.sh"
+    ;;
+  logs)
+    docker compose logs --tail=150 "${2:-}"
+    ;;
+  stop)
+    docker compose stop
+    ;;
+  start)
+    docker compose up -d
+    ;;
+  restart)
+    docker compose restart
+    ;;
+  update)
+    git pull --ff-only
+    exec "$repo_dir/scripts/deploy.sh"
+    ;;
+  bootstrap-code)
+    data_dir=$(awk -F= '$1=="PVR_DATA_DIR"{print substr($0,index($0,"=")+1)}' .env)
+    sudo -u "$(id -un)" cat "$data_dir/secrets/bootstrap-code"
+    ;;
+  access-token)
+    data_dir=$(awk -F= '$1=="PVR_DATA_DIR"{print substr($0,index($0,"=")+1)}' .env)
+    cat "$data_dir/secrets/initial-access-token"
+    ;;
+  pair-code)
+    data_dir=$(awk -F= '$1=="PVR_DATA_DIR"{print substr($0,index($0,"=")+1)}' .env)
+    token=$(cat "$data_dir/secrets/initial-access-token")
+    curl -fsS -X POST -H "Authorization: Bearer $token" -H 'Content-Type: application/json' -d '{"expires_minutes":30}' http://127.0.0.1:${PVR_BIND_PORT:-5001}/api/pairing-codes
+    ;;
+  backup)
+    exec "$repo_dir/scripts/backup.sh" "${2:-}"
+    ;;
+  evaluate)
+    docker compose exec -T api python - --token-file /data/secrets/initial-access-token < "$repo_dir/scripts/evaluate.py"
+    ;;
+  restore)
+    if [[ $# -ne 2 ]]; then echo "Usage: scripts/vaultctl restore BACKUP.tar.gz" >&2; exit 2; fi
+    exec "$repo_dir/scripts/restore.sh" "$2"
+    ;;
+  *)
+    echo "Usage: scripts/vaultctl {deploy|status|health|verify|logs [service]|stop|start|restart|update|access-token|pair-code|evaluate|backup [directory]|restore FILE}" >&2
+    exit 2
+    ;;
+esac
