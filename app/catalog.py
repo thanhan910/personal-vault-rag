@@ -58,6 +58,45 @@ def create_job(db, vault_id: str, kind: str, payload: dict[str, Any], priority: 
     return job_id
 
 
+def _enqueue_missing_embedding_jobs(db, vault_id: str, version_id: str | None = None) -> dict[str, int]:
+    vault = db.execute(
+        "SELECT provider_ciphertext,monthly_budget_microusd,embedding_model,visual_model FROM vaults WHERE id=?",
+        (vault_id,),
+    ).fetchone()
+    queued = {"text": 0, "visual": 0}
+    if not vault or not vault["provider_ciphertext"] or vault["monthly_budget_microusd"] <= 0:
+        return queued
+    version_clause = " AND v.id=?" if version_id else ""
+    params: list[Any] = [vault_id]
+    if version_id:
+        params.append(version_id)
+    rows = db.execute(
+        f"""SELECT v.id,
+                   EXISTS(SELECT 1 FROM chunks c WHERE c.vault_id=v.vault_id AND c.version_id=v.id AND c.kind<>'visual' AND c.text<>'') has_text,
+                   EXISTS(SELECT 1 FROM previews p WHERE p.vault_id=v.vault_id AND p.version_id=v.id) has_visual
+            FROM versions v JOIN documents d ON d.vault_id=v.vault_id AND d.current_version_id=v.id
+            WHERE v.vault_id=? AND d.deleted_at IS NULL AND v.lexical_indexed_at IS NOT NULL{version_clause}""",
+        params,
+    ).fetchall()
+    for row in rows:
+        readiness = db.execute(
+            "SELECT text_indexed_at,embedding_model,visual_indexed_at,visual_model FROM versions WHERE vault_id=? AND id=?",
+            (vault_id, row["id"]),
+        ).fetchone()
+        if row["has_text"] and (not readiness["text_indexed_at"] or readiness["embedding_model"] != vault["embedding_model"]):
+            create_job(db, vault_id, "embed_text", {"version_id": row["id"], "model": vault["embedding_model"]}, priority=80)
+            queued["text"] += 1
+        if row["has_visual"] and (not readiness["visual_indexed_at"] or readiness["visual_model"] != vault["visual_model"]):
+            create_job(db, vault_id, "embed_visual", {"version_id": row["id"], "model": vault["visual_model"]}, priority=85)
+            queued["visual"] += 1
+    return queued
+
+
+def enqueue_missing_embedding_jobs(vault_id: str, version_id: str | None = None) -> dict[str, int]:
+    with connect() as db, transaction(db, immediate=True):
+        return _enqueue_missing_embedding_jobs(db, vault_id, version_id)
+
+
 def register_upload(
     vault_id: str,
     source_id: str,
@@ -114,13 +153,29 @@ def register_upload(
             ),
         )
         version = db.execute(
-            "SELECT indexed_at FROM versions WHERE vault_id=? AND id=?", (vault_id, version_id)
+            "SELECT indexed_at,visual_recovery_needed FROM versions WHERE vault_id=? AND id=?", (vault_id, version_id)
         ).fetchone()
         if version and version["indexed_at"]:
+            if version["visual_recovery_needed"]:
+                expiry = stamp + settings().staging_ttl_hours * 3600
+                db.execute(
+                    "UPDATE versions SET raw_staging_path=?,raw_expires_at=? WHERE vault_id=? AND id=?",
+                    (str(staging_path), expiry, vault_id, version_id),
+                )
+                job_id = create_job(db, vault_id, "render_visual", {"document_id": document_id, "version_id": version_id}, priority=70)
+                return document_id, version_id, job_id
             db.execute(
                 "UPDATE documents SET current_version_id=?, state='indexed' WHERE vault_id=? AND id=?",
                 (version_id, vault_id, document_id),
             )
+            create_job(
+                db,
+                vault_id,
+                "mark_historical",
+                {"document_id": document_id, "current_version_id": version_id},
+                priority=30,
+            )
+            _enqueue_missing_embedding_jobs(db, vault_id, version_id)
             return document_id, version_id, "unchanged"
         expiry = stamp + settings().staging_ttl_hours * 3600
         db.execute(
@@ -274,11 +329,17 @@ def cleanup_expired() -> dict[str, int]:
         for row in previews:
             Path(row["path"]).unlink(missing_ok=True)
             removed += 1
+        expired_versions = {(row["vault_id"], row["version_id"]) for row in previews}
         db.execute("DELETE FROM previews WHERE created_at<?", (stamp - settings().preview_ttl_days * 86400,))
-        db.execute(
-            """UPDATE versions SET preview_bytes=COALESCE((SELECT SUM(LENGTH(path)) * 0 FROM previews p
-               WHERE p.vault_id=versions.vault_id AND p.version_id=versions.id),0)
-               WHERE indexed_at IS NOT NULL AND created_at<?""",
-            (stamp - settings().preview_ttl_days * 86400,),
-        )
+        for vault_id, version_id in expired_versions:
+            db.execute(
+                "DELETE FROM embedding_batches WHERE vault_id=? AND version_id=? AND modality='visual'",
+                (vault_id, version_id),
+            )
+            db.execute(
+                """UPDATE versions SET preview_bytes=0,visual_indexed_at=NULL,visual_model=NULL,visual_recovery_needed=1
+                   WHERE vault_id=? AND id=?""",
+                (vault_id, version_id),
+            )
+            create_job(db, vault_id, "delete_version_vectors", {"version_id": version_id, "modality": "visual"}, priority=20)
     return {"files_removed": removed}

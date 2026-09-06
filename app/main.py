@@ -9,7 +9,7 @@ import secrets
 import shutil
 import time
 import uuid
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from urllib.parse import urlparse
 
 from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, Request, UploadFile
@@ -18,7 +18,7 @@ from fastapi.staticfiles import StaticFiles
 from mcp.server.transport_security import TransportSecuritySettings
 from pydantic import BaseModel, Field
 
-from .catalog import SUPPORTED_EXTENSIONS, complete_reconcile, register_upload, storage_usage
+from .catalog import SUPPORTED_EXTENSIONS, complete_reconcile, create_job, enqueue_missing_embedding_jobs, register_upload, storage_usage
 from .config import settings
 from .db import connect, init_db, now, transaction
 from .mcp_server import mcp
@@ -61,7 +61,7 @@ async def lifespan(_app: FastAPI):
         yield
 
 
-app = FastAPI(title="Personal Vault RAG", version="0.1.0", lifespan=lifespan)
+app = FastAPI(title="Personal Vault RAG", version="0.2.0", lifespan=lifespan)
 app.include_router(oauth_router)
 app.mount("/static", StaticFiles(directory=Path(__file__).parent / "static"), name="static")
 
@@ -70,7 +70,7 @@ app.mount("/static", StaticFiles(directory=Path(__file__).parent / "static"), na
 def health() -> dict:
     with connect() as db:
         db.execute("SELECT 1").fetchone()
-    return {"status": "ok", "version": "0.1.0", "qdrant": settings().qdrant_url}
+    return {"status": "ok", "version": "0.2.0", "qdrant": settings().qdrant_url}
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -261,7 +261,10 @@ def seen(body: SeenRequest, principal: Principal = Depends(require_principal)) -
     principal.require("ingest")
     with connect() as db, transaction(db, immediate=True):
         row = db.execute(
-            "SELECT source_id FROM documents WHERE vault_id=? AND id=?", (principal.vault_id, body.document_id)
+            """SELECT d.source_id,COALESCE(v.visual_recovery_needed,0) visual_recovery_needed
+               FROM documents d LEFT JOIN versions v ON v.vault_id=d.vault_id AND v.id=d.current_version_id
+               WHERE d.vault_id=? AND d.id=?""",
+            (principal.vault_id, body.document_id),
         ).fetchone()
         if not row or row["source_id"] != body.source_id:
             raise HTTPException(404, "Document is not registered to this source")
@@ -271,7 +274,12 @@ def seen(body: SeenRequest, principal: Principal = Depends(require_principal)) -
                WHERE vault_id=? AND id=?""",
             (body.relative_path, body.display_name, body.mtime_ns, body.size_bytes, body.scan_generation, now(), principal.vault_id, body.document_id),
         )
-    return {"document_id": body.document_id, "state": "seen"}
+    return {
+        "document_id": body.document_id,
+        "state": "seen",
+        "needs_content": bool(row["visual_recovery_needed"]),
+        "reason": "visual_preview_recovery" if row["visual_recovery_needed"] else None,
+    }
 
 
 class ReconcileRequest(BaseModel):
@@ -301,7 +309,9 @@ def provider_config(body: ProviderRequest, principal: Principal = Depends(requir
             db.execute("UPDATE vaults SET provider_ciphertext=?,monthly_budget_microusd=? WHERE id=?", (encrypted, int(body.monthly_budget_usd * 1_000_000), principal.vault_id))
         else:
             db.execute("UPDATE vaults SET monthly_budget_microusd=? WHERE id=?", (int(body.monthly_budget_usd * 1_000_000), principal.vault_id))
-    return {"configured": encrypted is not None, "monthly_budget_usd": body.monthly_budget_usd, "note": "The allowance limits this app only."}
+        configured = bool(db.execute("SELECT provider_ciphertext FROM vaults WHERE id=?", (principal.vault_id,)).fetchone()["provider_ciphertext"])
+    queued = enqueue_missing_embedding_jobs(principal.vault_id) if configured and body.monthly_budget_usd > 0 else {"text": 0, "visual": 0}
+    return {"configured": configured, "monthly_budget_usd": body.monthly_budget_usd, "backfill_jobs_queued": queued, "note": "The allowance limits this app only; readiness reflects completed index coverage."}
 
 
 @app.get("/api/status")
@@ -312,7 +322,20 @@ def status(principal: Principal = Depends(require_principal)) -> dict:
         sources = [dict(row) for row in db.execute("SELECT * FROM sources WHERE vault_id=?", (principal.vault_id,))]
         jobs = [dict(row) for row in db.execute("SELECT state,kind,COUNT(*) count FROM jobs WHERE vault_id=? GROUP BY state,kind", (principal.vault_id,))]
         documents = [dict(row) for row in db.execute("SELECT state,COUNT(*) count FROM documents WHERE vault_id=? GROUP BY state", (principal.vault_id,))]
-    return {"vault": vault, "sources": sources, "jobs": jobs, "documents": documents, "storage": storage_usage(principal.vault_id)}
+        readiness = dict(db.execute(
+            """SELECT COUNT(*) current_versions,
+                      SUM(CASE WHEN v.lexical_indexed_at IS NOT NULL THEN 1 ELSE 0 END) lexical_ready,
+                      SUM(CASE WHEN EXISTS(SELECT 1 FROM chunks c WHERE c.vault_id=v.vault_id AND c.version_id=v.id AND c.kind<>'visual' AND c.text<>'') THEN 1 ELSE 0 END) text_eligible,
+                      SUM(CASE WHEN v.text_indexed_at IS NOT NULL AND v.embedding_model=x.embedding_model THEN 1 ELSE 0 END) text_ready,
+                      SUM(CASE WHEN EXISTS(SELECT 1 FROM chunks c WHERE c.vault_id=v.vault_id AND c.version_id=v.id AND c.kind='visual') THEN 1 ELSE 0 END) visual_eligible,
+                      SUM(CASE WHEN v.visual_indexed_at IS NOT NULL AND v.visual_model=x.visual_model THEN 1 ELSE 0 END) visual_ready,
+                      SUM(CASE WHEN v.visual_recovery_needed=1 THEN 1 ELSE 0 END) visual_recovery_needed
+               FROM versions v JOIN documents d ON d.vault_id=v.vault_id AND d.current_version_id=v.id
+               JOIN vaults x ON x.id=v.vault_id WHERE v.vault_id=? AND d.deleted_at IS NULL""",
+            (principal.vault_id,),
+        ).fetchone())
+    readiness = {key: int(value or 0) for key, value in readiness.items()}
+    return {"vault": vault, "index_readiness": readiness, "sources": sources, "jobs": jobs, "documents": documents, "storage": storage_usage(principal.vault_id)}
 
 
 class SearchRequest(BaseModel):
@@ -321,6 +344,7 @@ class SearchRequest(BaseModel):
     source_id: str | None = None
     media_type: str | None = None
     path_prefix: str | None = None
+    include_history: bool = False
 
 
 @app.post("/api/search")
@@ -343,13 +367,34 @@ def api_visual_preview(document_id: str, preview_index: int, principal: Principa
     principal.require("search")
     with connect() as db:
         row = db.execute(
-            """SELECT p.path,p.media_type FROM previews p JOIN documents d
+            """SELECT p.path,p.media_type,p.version_id FROM previews p JOIN documents d
                ON d.vault_id=p.vault_id AND d.id=p.document_id AND d.current_version_id=p.version_id
                WHERE p.vault_id=? AND p.document_id=? AND p.ordinal=? AND d.deleted_at IS NULL""",
             (principal.vault_id, document_id, min(max(preview_index, 0), 119)),
         ).fetchone()
-    if not row or not Path(row["path"]).is_file():
-        raise HTTPException(404, "Visual preview is unavailable or expired")
+    if not row:
+        with connect() as db:
+            recovery = db.execute(
+                """SELECT v.visual_recovery_needed FROM documents d JOIN versions v
+                   ON v.vault_id=d.vault_id AND v.id=d.current_version_id
+                   WHERE d.vault_id=? AND d.id=? AND d.deleted_at IS NULL""",
+                (principal.vault_id, document_id),
+            ).fetchone()
+        if recovery and recovery["visual_recovery_needed"]:
+            raise HTTPException(410, "Visual preview expired; the connector will request source bytes on its next complete scan")
+        raise HTTPException(404, "Visual preview is unavailable")
+    if not Path(row["path"]).is_file():
+        with connect() as db, transaction(db, immediate=True):
+            db.execute(
+                "DELETE FROM embedding_batches WHERE vault_id=? AND version_id=? AND modality='visual'",
+                (principal.vault_id, row["version_id"]),
+            )
+            db.execute(
+                "UPDATE versions SET visual_indexed_at=NULL,visual_model=NULL,visual_recovery_needed=1 WHERE vault_id=? AND id=?",
+                (principal.vault_id, row["version_id"]),
+            )
+            create_job(db, principal.vault_id, "delete_version_vectors", {"version_id": row["version_id"], "modality": "visual"}, priority=20)
+        raise HTTPException(410, "Visual preview is missing; the connector will request source bytes on its next complete scan")
     return FileResponse(row["path"], media_type=row["media_type"], headers={"Cache-Control": "private, no-store"})
 
 
@@ -373,8 +418,8 @@ def api_table_calculate(body: TableCalculationRequest, principal: Principal = De
 def pending_artifacts(principal: Principal = Depends(require_principal)) -> dict:
     principal.require("ingest")
     with connect() as db:
-        rows = db.execute("SELECT id,file_name,media_type,note_text,provenance_json,created_at,expires_at FROM pending_artifacts WHERE vault_id=? AND state='pending' AND expires_at>? ORDER BY created_at LIMIT 20", (principal.vault_id, now())).fetchall()
-    return {"artifacts": [{**dict(row), "provenance": json.loads(row["provenance_json"]), "has_file": row["note_text"] is None} for row in rows]}
+        rows = db.execute("SELECT id,file_name,media_type,artifact_kind,note_text,content_sha256,content_size_bytes,provenance_json,created_at,expires_at,delivery_attempts FROM pending_artifacts WHERE vault_id=? AND state='pending' AND expires_at>? ORDER BY created_at LIMIT 20", (principal.vault_id, now())).fetchall()
+    return {"artifacts": [{**dict(row), "provenance": json.loads(row["provenance_json"]), "has_file": row["artifact_kind"] == "file"} for row in rows]}
 
 
 @app.get("/api/connector/artifacts/{artifact_id}/content")
@@ -384,14 +429,18 @@ def artifact_content(artifact_id: str, principal: Principal = Depends(require_pr
         row = db.execute("SELECT * FROM pending_artifacts WHERE vault_id=? AND id=? AND state='pending' AND expires_at>?", (principal.vault_id, artifact_id, now())).fetchone()
     if not row:
         raise HTTPException(404, "Pending artifact not found")
-    if row["note_text"] is not None:
+    if row["artifact_kind"] == "note":
         return JSONResponse({"text": row["note_text"]})
+    if not row["staging_path"] or not Path(row["staging_path"]).is_file():
+        raise HTTPException(410, "Staged artifact content is unavailable")
     return FileResponse(row["staging_path"], filename=row["file_name"], media_type=row["media_type"])
 
 
 class ArtifactComplete(BaseModel):
     success: bool
     saved_relative_path: str | None = None
+    content_sha256: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
+    content_size_bytes: int | None = Field(default=None, ge=0)
     error: str | None = None
 
 
@@ -402,12 +451,32 @@ def artifact_complete(artifact_id: str, body: ArtifactComplete, principal: Princ
         row = db.execute("SELECT * FROM pending_artifacts WHERE vault_id=? AND id=? AND state='pending'", (principal.vault_id, artifact_id)).fetchone()
         if not row:
             raise HTTPException(404, "Pending artifact not found")
-        if body.success and not body.saved_relative_path:
-            raise HTTPException(422, "saved_relative_path is required on success")
-        db.execute("UPDATE pending_artifacts SET state=?,completed_at=?,error=? WHERE vault_id=? AND id=?", ("saved" if body.success else "failed", now(), body.error, principal.vault_id, artifact_id))
-    if row["staging_path"]:
+        if body.success:
+            normalized_path = (body.saved_relative_path or "").replace("\\", "/")
+            saved_path = PurePosixPath(normalized_path)
+            if not normalized_path or saved_path.is_absolute() or ".." in saved_path.parts:
+                raise HTTPException(422, "A safe saved_relative_path is required on success")
+            if body.content_sha256 != row["content_sha256"] or body.content_size_bytes != row["content_size_bytes"]:
+                raise HTTPException(422, "Delivered content fingerprint does not match the staged artifact")
+            db.execute(
+                """UPDATE pending_artifacts SET state='saved',completed_at=?,saved_relative_path=?,delivery_attempts=delivery_attempts+1,error=NULL
+                   WHERE vault_id=? AND id=?""",
+                (now(), saved_path.as_posix(), principal.vault_id, artifact_id),
+            )
+        else:
+            db.execute(
+                "UPDATE pending_artifacts SET state='pending',delivery_attempts=delivery_attempts+1,error=? WHERE vault_id=? AND id=?",
+                ((body.error or "Connector delivery failed")[:2000], principal.vault_id, artifact_id),
+            )
+    if body.success and row["staging_path"]:
         Path(row["staging_path"]).unlink(missing_ok=True)
-    return {"artifact_id": artifact_id, "state": "saved" if body.success else "failed", "saved": body.success, "saved_relative_path": body.saved_relative_path}
+    return {
+        "artifact_id": artifact_id,
+        "state": "saved_to_source" if body.success else "pending_retry",
+        "saved": body.success,
+        "index_state": "pending_connector_scan" if body.success else "not_saved",
+        "saved_relative_path": saved_path.as_posix() if body.success else None,
+    }
 
 
 @app.get("/view/{document_id}", response_class=HTMLResponse)

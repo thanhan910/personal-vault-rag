@@ -28,9 +28,15 @@ class ExtractedChunk:
 
 
 @dataclass
+class ExtractedPreview:
+    path: Path
+    locator: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
 class ExtractionResult:
     chunks: list[ExtractedChunk]
-    previews: list[Path] = field(default_factory=list)
+    previews: list[ExtractedPreview] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
     coverage: dict[str, Any] = field(default_factory=dict)
 
@@ -160,13 +166,13 @@ def _xlsx_structured(path: Path, base: ExtractionResult | None = None) -> Extrac
     return ExtractionResult(chunks, base.previews if base else [], warnings, {"extractor": "docling+openpyxl" if base else "openpyxl", "sheets": workbook.sheetnames})
 
 
-def _image_preview(path: Path, preview_dir: Path) -> list[Path]:
+def _image_preview(path: Path, preview_dir: Path) -> list[ExtractedPreview]:
     preview_dir.mkdir(parents=True, exist_ok=True)
     target = preview_dir / "image.webp"
     with Image.open(path) as image:
         image.thumbnail((1800, 1800))
         image.convert("RGB").save(target, "WEBP", quality=82, method=4)
-    return [target]
+    return [ExtractedPreview(target, {"image": 1})]
 
 
 def _image_ocr(path: Path) -> ExtractionResult:
@@ -180,7 +186,7 @@ def _image_ocr(path: Path) -> ExtractionResult:
     return ExtractionResult(chunks, warnings=["Docling failed; used local Tesseract English/Vietnamese OCR"], coverage={"images": 1})
 
 
-def _pdf_previews(path: Path, preview_dir: Path) -> tuple[list[Path], list[str]]:
+def _pdf_previews(path: Path, preview_dir: Path) -> tuple[list[ExtractedPreview], list[str]]:
     preview_dir.mkdir(parents=True, exist_ok=True)
     reader = PdfReader(path)
     page_count = len(reader.pages)
@@ -192,19 +198,26 @@ def _pdf_previews(path: Path, preview_dir: Path) -> tuple[list[Path], list[str]]
         stderr=subprocess.DEVNULL,
     )
     warnings = [] if sampled == page_count else [f"Visual previews cover the first {sampled} of {page_count} PDF pages"]
-    return sorted(preview_dir.glob("page-*.jpg")), warnings
+    def page_number(item: Path) -> int:
+        match = re.search(r"-(\d+)$", item.stem)
+        if not match:
+            raise RuntimeError(f"Rendered PDF preview has no page number: {item.name}")
+        return int(match.group(1))
+
+    previews = [ExtractedPreview(item, {"page": page_number(item)}) for item in sorted(preview_dir.glob("page-*.jpg"), key=page_number)]
+    return previews, warnings
 
 
-def _pdf_ocr(previews: list[Path]) -> list[ExtractedChunk]:
+def _pdf_ocr(previews: list[ExtractedPreview]) -> list[ExtractedChunk]:
     chunks: list[ExtractedChunk] = []
-    for page_number, preview in enumerate(previews, 1):
+    for preview in previews:
         completed = subprocess.run(
-            ["tesseract", str(preview), "stdout", "-l", "eng+vie"],
+            ["tesseract", str(preview.path), "stdout", "-l", "eng+vie"],
             check=True,
             capture_output=True,
             text=True,
         )
-        chunks.extend(_split(completed.stdout, {"page": page_number}, kind="ocr"))
+        chunks.extend(_split(completed.stdout, dict(preview.locator), kind="ocr"))
     return chunks
 
 
@@ -212,30 +225,49 @@ def _media(path: Path, preview_dir: Path) -> ExtractionResult:
     from faster_whisper import WhisperModel
 
     preview_dir.mkdir(parents=True, exist_ok=True)
+    is_video = path.suffix.casefold() in {".mp4", ".mov", ".mkv", ".webm"}
     audio_path = preview_dir / "audio.wav"
-    subprocess.run(
-        ["ffmpeg", "-nostdin", "-loglevel", "error", "-i", str(path), "-vn", "-ac", "1", "-ar", "16000", "-y", str(audio_path)],
-        check=True,
-    )
-    model = WhisperModel("small", device="cpu", compute_type="int8", cpu_threads=2)
-    segments, info = model.transcribe(str(audio_path), beam_size=3, vad_filter=True)
+    warnings: list[str] = []
     chunks: list[ExtractedChunk] = []
-    for segment in segments:
-        chunks.extend(_split(segment.text, {"time_start": round(segment.start, 2), "time_end": round(segment.end, 2)}, kind="transcript"))
-    audio_path.unlink(missing_ok=True)
-    previews: list[Path] = []
-    if path.suffix.casefold() in {".mp4", ".mov", ".mkv", ".webm"}:
+    language = None
+    duration = None
+    try:
+        subprocess.run(
+            ["ffmpeg", "-nostdin", "-loglevel", "error", "-i", str(path), "-vn", "-ac", "1", "-ar", "16000", "-y", str(audio_path)],
+            check=True,
+        )
+    except subprocess.CalledProcessError:
+        if not is_video:
+            raise
+        warnings.append("Video has no usable audio stream; indexed visual frames only")
+    if audio_path.is_file():
+        model = WhisperModel("small", device="cpu", compute_type="int8", cpu_threads=2)
+        segments, info = model.transcribe(str(audio_path), beam_size=3, vad_filter=True)
+        language, duration = info.language, info.duration
+        for segment in segments:
+            chunks.extend(_split(segment.text, {"time_start": round(segment.start, 2), "time_end": round(segment.end, 2)}, kind="transcript"))
+        audio_path.unlink(missing_ok=True)
+    previews: list[ExtractedPreview] = []
+    if is_video:
         pattern = preview_dir / "frame-%04d.jpg"
         subprocess.run(
             ["ffmpeg", "-nostdin", "-loglevel", "error", "-i", str(path), "-vf", f"fps=1/{settings().frame_interval_seconds},scale='min(1280,iw)':-2", "-frames:v", str(settings().max_video_frames), "-q:v", "4", "-y", str(pattern)],
             check=True,
         )
-        previews = sorted(preview_dir.glob("frame-*.jpg"))
+        previews = [
+            ExtractedPreview(
+                item,
+                {"time_start": (index - 1) * settings().frame_interval_seconds, "time_end": index * settings().frame_interval_seconds},
+            )
+            for index, item in enumerate(sorted(preview_dir.glob("frame-*.jpg")), 1)
+        ]
+        if previews:
+            warnings.append(f"Video frames sampled every {settings().frame_interval_seconds}s; fleeting events can be missed")
     return ExtractionResult(
         chunks,
         previews,
-        [f"Video frames sampled every {settings().frame_interval_seconds}s; fleeting events can be missed"] if previews else [],
-        {"language": info.language, "duration_seconds": info.duration, "frame_count": len(previews)},
+        warnings,
+        {"language": language, "duration_seconds": duration, "frame_count": len(previews)},
     )
 
 
@@ -277,6 +309,6 @@ def extract_document(path: Path, display_name: str, preview_dir: Path) -> Extrac
         if not result.chunks:
             result.chunks = _pdf_ocr(previews)
             result.warnings.append("Structured extraction found no text; used local English/Vietnamese OCR on rendered pages")
-    if not result.chunks:
+    if not result.chunks and not result.previews:
         raise RuntimeError("Extraction completed without readable content")
     return result

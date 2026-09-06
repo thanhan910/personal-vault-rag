@@ -39,6 +39,10 @@ def ensure_collection(vault_id: str, dimensions: int, modality: str = "text") ->
         )
         client.create_payload_index(name, "document_id", models.PayloadSchemaType.KEYWORD)
         client.create_payload_index(name, "version_id", models.PayloadSchemaType.KEYWORD)
+        client.create_payload_index(name, "source_id", models.PayloadSchemaType.KEYWORD)
+        client.create_payload_index(name, "media_filters", models.PayloadSchemaType.KEYWORD)
+        client.create_payload_index(name, "path_prefixes", models.PayloadSchemaType.KEYWORD)
+        client.create_payload_index(name, "current", models.PayloadSchemaType.BOOL)
     return name
 
 
@@ -60,6 +64,10 @@ def upsert_text_vectors(vault_id: str, chunks: list[dict[str, Any]], vectors: li
                     "document_id": chunk["document_id"],
                     "version_id": chunk["version_id"],
                     "kind": chunk["kind"],
+                    "source_id": chunk["source_id"],
+                    "media_filters": chunk["media_filters"],
+                    "path_prefixes": chunk["path_prefixes"],
+                    "current": True,
                 },
             )
         )
@@ -71,7 +79,19 @@ def upsert_visual_vectors(vault_id: str, items: list[dict[str, Any]], vectors: l
     points = [
         models.PointStruct(
             id=point_id(item["id"]), vector=vector,
-            payload={"vault_id": vault_id, "chunk_id": item["chunk_id"], "document_id": item["document_id"], "version_id": item["version_id"], "preview_path": item["preview_path"]},
+            payload={
+                "vault_id": vault_id,
+                "chunk_id": item["chunk_id"],
+                "document_id": item["document_id"],
+                "version_id": item["version_id"],
+                "preview_id": item["preview_id"],
+                "preview_ordinal": item["preview_ordinal"],
+                "locator_json": item["locator_json"],
+                "source_id": item["source_id"],
+                "media_filters": item["media_filters"],
+                "path_prefixes": item["path_prefixes"],
+                "current": True,
+            },
         )
         for item, vector in zip(items, vectors, strict=True)
     ]
@@ -92,6 +112,51 @@ def delete_document_vectors(vault_id: str, document_id: str) -> None:
             )
 
 
+def delete_version_vectors(vault_id: str, version_id: str, modality: str | None = None) -> None:
+    client = qdrant()
+    for selected in ((modality,) if modality else ("text", "visual")):
+        name = collection_name(vault_id, selected)
+        if client.collection_exists(name):
+            client.delete(
+                name,
+                points_selector=models.FilterSelector(
+                    filter=models.Filter(must=[models.FieldCondition(key="version_id", match=models.MatchValue(value=version_id))])
+                ),
+                wait=True,
+            )
+
+
+def mark_document_vectors_historical(vault_id: str, document_id: str, current_version_id: str) -> None:
+    with connect() as db:
+        document = db.execute(
+            "SELECT source_id,media_type,relative_path FROM documents WHERE vault_id=? AND id=? AND current_version_id=? AND deleted_at IS NULL",
+            (vault_id, document_id, current_version_id),
+        ).fetchone()
+    if not document:
+        return
+    client = qdrant()
+    document_selector = models.Filter(
+        must=[models.FieldCondition(key="document_id", match=models.MatchValue(value=document_id))],
+    )
+    current_selector = models.Filter(
+        must=[
+            models.FieldCondition(key="document_id", match=models.MatchValue(value=document_id)),
+            models.FieldCondition(key="version_id", match=models.MatchValue(value=current_version_id)),
+        ],
+    )
+    common_payload = {
+        "source_id": document["source_id"],
+        "media_filters": _media_filter_values(document["media_type"]),
+        "path_prefixes": _path_prefix_values(document["relative_path"]),
+        "current": False,
+    }
+    for modality in ("text", "visual"):
+        name = collection_name(vault_id, modality)
+        if client.collection_exists(name):
+            client.set_payload(name, common_payload, points=document_selector, wait=True)
+            client.set_payload(name, {"current": True}, points=current_selector, wait=True)
+
+
 def _fts_expression(query: str) -> str:
     tokens = re.findall(r"[\w.-]{2,}", query, flags=re.UNICODE)[:24]
     return " OR ".join(f'"{token.replace(chr(34), "")}"' for token in tokens)
@@ -105,35 +170,71 @@ def _lexical(vault_id: str, query: str, limit: int, filters: dict[str, Any]) -> 
              ON d.vault_id=f.vault_id AND d.id=f.document_id
              WHERE chunks_fts MATCH ? AND f.vault_id=? AND d.deleted_at IS NULL"""
     params: list[Any] = [expression, vault_id]
+    if not filters.get("include_history"):
+        sql += " AND f.version_id=d.current_version_id"
     if filters.get("source_id"):
         sql += " AND d.source_id=?"
         params.append(filters["source_id"])
     if filters.get("media_type"):
         sql += " AND d.media_type LIKE ?"
-        params.append(filters["media_type"] + "%")
+        params.append(str(filters["media_type"]).rstrip("*") + "%")
     if filters.get("path_prefix"):
-        sql += " AND d.relative_path LIKE ? ESCAPE '\\'"
-        escaped = str(filters["path_prefix"]).replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
-        params.append(escaped + "%")
+        sql += " AND (d.relative_path=? OR d.relative_path LIKE ? ESCAPE '\\')"
+        normalized = str(filters["path_prefix"]).replace("\\", "/").strip("/")
+        escaped = normalized.replace("%", "\\%").replace("_", "\\_")
+        params.extend((normalized, escaped + "/%"))
     sql += " ORDER BY bm25(chunks_fts) LIMIT ?"
     params.append(limit)
     with connect() as db:
         return [row["chunk_id"] for row in db.execute(sql, params).fetchall()]
 
 
+def _normalized_prefix(value: str) -> str:
+    return value.replace("\\", "/").strip("/").casefold()
+
+
+def _media_filter_values(media_type: str | None) -> list[str]:
+    value = (media_type or "application/octet-stream").casefold()
+    return list(dict.fromkeys((value, value.split("/", 1)[0])))
+
+
+def _path_prefix_values(relative_path: str) -> list[str]:
+    parts = [part for part in _normalized_prefix(relative_path).split("/") if part]
+    return ["/".join(parts[:index]) for index in range(1, len(parts) + 1)]
+
+
+def _qdrant_filter(vault_id: str, filters: dict[str, Any]) -> models.Filter:
+    must = [models.FieldCondition(key="vault_id", match=models.MatchValue(value=vault_id))]
+    if filters.get("document_id"):
+        must.append(models.FieldCondition(key="document_id", match=models.MatchValue(value=filters["document_id"])))
+    if filters.get("source_id"):
+        must.append(models.FieldCondition(key="source_id", match=models.MatchValue(value=filters["source_id"])))
+    if filters.get("media_type"):
+        must.append(models.FieldCondition(key="media_filters", match=models.MatchValue(value=str(filters["media_type"]).rstrip("/*").casefold())))
+    if filters.get("path_prefix"):
+        must.append(models.FieldCondition(key="path_prefixes", match=models.MatchValue(value=_normalized_prefix(str(filters["path_prefix"])))))
+    if not filters.get("include_history"):
+        must.append(models.FieldCondition(key="current", match=models.MatchValue(value=True)))
+    return models.Filter(must=must)
+
+
 def _dense(vault_id: str, query: str, limit: int, filters: dict[str, Any]) -> tuple[list[str], str | None]:
     with connect() as db:
-        vault = db.execute("SELECT embedding_dimensions FROM vaults WHERE id=?", (vault_id,)).fetchone()
+        ready = db.execute(
+            """SELECT COUNT(*) count FROM versions v JOIN documents d ON d.vault_id=v.vault_id AND d.current_version_id=v.id
+               JOIN vaults x ON x.id=v.vault_id
+               WHERE v.vault_id=? AND d.deleted_at IS NULL AND v.text_indexed_at IS NOT NULL AND v.embedding_model=x.embedding_model""",
+            (vault_id,),
+        ).fetchone()["count"]
+    if not ready:
+        return [], "Dense index coverage is zero; provider configuration alone does not mean documents are embedded"
+    name = collection_name(vault_id)
+    client = qdrant()
+    if not client.collection_exists(name):
+        return [], "Dense index is marked ready but its vector collection is unavailable"
     try:
         vector = embed_texts(vault_id, [query], "query", f"query:{uuid.uuid4().hex}")[0]
-        name = collection_name(vault_id)
-        client = qdrant()
-        if not client.collection_exists(name):
-            return [], "Dense index has not been built yet"
-        must = [models.FieldCondition(key="vault_id", match=models.MatchValue(value=vault_id))]
-        if filters.get("document_id"):
-            must.append(models.FieldCondition(key="document_id", match=models.MatchValue(value=filters["document_id"])))
-        result = client.query_points(name, query=vector, query_filter=models.Filter(must=must), limit=limit, with_payload=True)
+        result = client.query_points(name, query=vector, query_filter=_qdrant_filter(vault_id, filters), limit=limit, with_payload=True)
         return [str(point.payload["chunk_id"]) for point in result.points], None
     except BudgetUnavailable as exc:
         return [], str(exc)
@@ -141,38 +242,67 @@ def _dense(vault_id: str, query: str, limit: int, filters: dict[str, Any]) -> tu
         return [], f"Dense retrieval unavailable: {type(exc).__name__}: {exc}"
 
 
-def _visual(vault_id: str, query: str, limit: int, filters: dict[str, Any]) -> tuple[list[str], str | None]:
+def _visual(vault_id: str, query: str, limit: int, filters: dict[str, Any]) -> tuple[list[dict[str, Any]], str | None]:
+    with connect() as db:
+        ready = db.execute(
+            """SELECT COUNT(*) count FROM versions v JOIN documents d ON d.vault_id=v.vault_id AND d.current_version_id=v.id
+               JOIN vaults x ON x.id=v.vault_id
+               WHERE v.vault_id=? AND d.deleted_at IS NULL AND v.visual_indexed_at IS NOT NULL AND v.visual_model=x.visual_model""",
+            (vault_id,),
+        ).fetchone()["count"]
+    if not ready:
+        return [], None
+    name = collection_name(vault_id, "visual")
+    client = qdrant()
+    if not client.collection_exists(name):
+        return [], "Visual index is marked ready but its vector collection is unavailable"
     try:
         vector = embed_visual_inputs(vault_id, [[query]], "query", f"visual-query:{uuid.uuid4().hex}")[0]
-        name = collection_name(vault_id, "visual")
-        client = qdrant()
-        if not client.collection_exists(name):
-            return [], None
-        must = [models.FieldCondition(key="vault_id", match=models.MatchValue(value=vault_id))]
-        if filters.get("document_id"):
-            must.append(models.FieldCondition(key="document_id", match=models.MatchValue(value=filters["document_id"])))
-        result = client.query_points(name, query=vector, query_filter=models.Filter(must=must), limit=limit, with_payload=True)
-        return [str(point.payload["chunk_id"]) for point in result.points], None
+        result = client.query_points(name, query=vector, query_filter=_qdrant_filter(vault_id, filters), limit=limit, with_payload=True)
+        return [
+            {
+                "chunk_id": str(point.payload["chunk_id"]),
+                "preview_id": point.payload.get("preview_id"),
+                "preview_ordinal": point.payload.get("preview_ordinal"),
+                "locator": json.loads(point.payload.get("locator_json") or "{}"),
+            }
+            for point in result.points
+        ], None
     except BudgetUnavailable as exc:
         return [], str(exc)
     except Exception as exc:
         return [], f"Visual retrieval unavailable: {type(exc).__name__}: {exc}"
 
 
-def _load_chunks(vault_id: str, chunk_ids: list[str]) -> dict[str, dict[str, Any]]:
+def _load_chunks(vault_id: str, chunk_ids: list[str], filters: dict[str, Any]) -> dict[str, dict[str, Any]]:
     if not chunk_ids:
         return {}
     placeholders = ",".join("?" for _ in chunk_ids)
     with connect() as db:
         rows = db.execute(
-            f"""SELECT c.*,d.display_name,d.relative_path,d.source_id,d.availability,d.revision_mtime_ns,
+            f"""SELECT c.*,d.display_name,d.relative_path,d.source_id,d.media_type,d.availability,d.revision_mtime_ns,d.current_version_id,
                        v.source_mtime_ns,v.indexed_at
                 FROM chunks c JOIN documents d ON d.vault_id=c.vault_id AND d.id=c.document_id
                 JOIN versions v ON v.vault_id=c.vault_id AND v.id=c.version_id
                 WHERE c.vault_id=? AND c.id IN ({placeholders}) AND d.deleted_at IS NULL""",
             [vault_id, *chunk_ids],
         ).fetchall()
-    return {row["id"]: dict(row) for row in rows}
+    loaded = {}
+    for item in rows:
+        row = dict(item)
+        if not filters.get("include_history") and row["version_id"] != row["current_version_id"]:
+            continue
+        if filters.get("source_id") and row["source_id"] != filters["source_id"]:
+            continue
+        if filters.get("media_type") and not (row["media_type"] or "").casefold().startswith(str(filters["media_type"]).rstrip("*").casefold()):
+            continue
+        if filters.get("path_prefix"):
+            relative = row["relative_path"].replace("\\", "/").strip("/").casefold()
+            prefix = _normalized_prefix(str(filters["path_prefix"]))
+            if relative != prefix and not relative.startswith(prefix + "/"):
+                continue
+        loaded[row["id"]] = row
+    return loaded
 
 
 def search(vault_id: str, query: str, limit: int = 8, filters: dict[str, Any] | None = None, include_adjacent: bool = True) -> dict[str, Any]:
@@ -181,14 +311,16 @@ def search(vault_id: str, query: str, limit: int = 8, filters: dict[str, Any] | 
     lexical = _lexical(vault_id, query, candidate_limit, filters)
     dense, dense_warning = _dense(vault_id, query, candidate_limit, filters)
     visual, visual_warning = _visual(vault_id, query, candidate_limit, filters)
+    visual_ids = [item["chunk_id"] for item in visual]
+    visual_identity = {item["chunk_id"]: item for item in visual}
     scores: defaultdict[str, float] = defaultdict(float)
     channels: defaultdict[str, list[str]] = defaultdict(list)
-    for channel, ranking in (("lexical", lexical), ("dense", dense), ("visual", visual)):
+    for channel, ranking in (("lexical", lexical), ("dense", dense), ("visual", visual_ids)):
         for rank, chunk_id in enumerate(ranking, 1):
             scores[chunk_id] += 1.0 / (60 + rank)
             channels[chunk_id].append(channel)
     ranked_ids = sorted(scores, key=scores.get, reverse=True)[: min(50, candidate_limit * 2)]
-    loaded = _load_chunks(vault_id, ranked_ids)
+    loaded = _load_chunks(vault_id, ranked_ids, filters)
     ranked_ids = [value for value in ranked_ids if value in loaded]
     rerank_warning = None
     if len(ranked_ids) > 1:
@@ -245,11 +377,14 @@ def search(vault_id: str, query: str, limit: int = 8, filters: dict[str, Any] | 
             "current_source_mtime_ns": row["revision_mtime_ns"],
             "revision_matches": row["source_mtime_ns"] == row["revision_mtime_ns"],
             "viewer_url": f"{settings().public_base_url}/view/{row['document_id']}?{urlencode(params)}",
+            "visual_evidence": visual_identity.get(chunk_id),
         })
     warnings = list(dict.fromkeys(message for message in (dense_warning, visual_warning, rerank_warning) if message))
+    if not lexical and (dense or visual_ids):
+        warnings.append("No lexical match was found; semantic or visual candidates require relevance validation before answering.")
     if not results:
         warnings.append("No supporting evidence was found. Do not infer a collection-specific answer.")
-    return {"query": query, "results": results, "warnings": warnings, "candidate_counts": {"lexical": len(lexical), "dense": len(dense), "visual": len(visual)}}
+    return {"query": query, "results": results, "warnings": warnings, "candidate_counts": {"lexical": len(lexical), "dense": len(dense), "visual": len(visual_ids)}}
 
 
 def fetch_chunk(vault_id: str, chunk_id: str, adjacent: int = 2) -> dict[str, Any]:

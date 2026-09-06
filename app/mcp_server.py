@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ipaddress
+import hashlib
 import json
 import mimetypes
 import socket
@@ -21,7 +22,7 @@ from pydantic import AnyHttpUrl, BaseModel, ConfigDict
 
 from .catalog import SUPPORTED_EXTENSIONS, create_job, storage_usage
 from .config import settings
-from .db import connect, now
+from .db import connect, now, transaction
 from .extraction import extract_document
 from .retrieval import calculate_table, fetch_chunk, search
 from .security import authenticate_token, new_token, token_hash
@@ -82,10 +83,10 @@ mcp = MCPServer(
 
 
 @mcp.tool(annotations=ToolAnnotations(readOnlyHint=True, openWorldHint=False, destructiveHint=False))
-def search_vault(question: str, limit: int = 8, source_id: str | None = None, media_type: str | None = None, path_prefix: str | None = None) -> dict[str, Any]:
+def search_vault(question: str, limit: int = 8, source_id: str | None = None, media_type: str | None = None, path_prefix: str | None = None, include_history: bool = False) -> dict[str, Any]:
     """Hybrid search. Pass the resolved question, including relevant conversation context."""
     vault_id = current_vault("search")
-    return search(vault_id, question, min(max(limit, 1), 20), {"source_id": source_id, "media_type": media_type, "path_prefix": path_prefix})
+    return search(vault_id, question, min(max(limit, 1), 20), {"source_id": source_id, "media_type": media_type, "path_prefix": path_prefix, "include_history": include_history})
 
 
 @mcp.tool(annotations=ToolAnnotations(readOnlyHint=True, openWorldHint=False, destructiveHint=False))
@@ -101,15 +102,38 @@ def calculate_spreadsheet(document_id: str, sheet_name: str, cell_range: str, op
 
 
 @mcp.tool(annotations=ToolAnnotations(readOnlyHint=True, openWorldHint=False, destructiveHint=False))
-def inspect_visual(document_id: str, preview_index: int = 0) -> Image:
+def inspect_visual(document_id: str, preview_index: int = 0, preview_id: str | None = None) -> Image:
     """Return one bounded derived page/image/video preview for visual inspection."""
     vault_id = current_vault("search")
     with connect() as db:
-        row = db.execute(
-            """SELECT p.path FROM previews p JOIN documents d ON d.vault_id=p.vault_id AND d.current_version_id=p.version_id
-               WHERE p.vault_id=? AND p.document_id=? AND p.ordinal=? AND d.deleted_at IS NULL""",
-            (vault_id, document_id, min(max(preview_index, 0), 119)),
-        ).fetchone()
+        if preview_id:
+            row = db.execute(
+                """SELECT p.path FROM previews p JOIN documents d ON d.vault_id=p.vault_id AND d.current_version_id=p.version_id
+                   WHERE p.vault_id=? AND p.document_id=? AND p.id=? AND d.deleted_at IS NULL""",
+                (vault_id, document_id, preview_id),
+            ).fetchone()
+        else:
+            row = db.execute(
+                """SELECT p.path FROM previews p JOIN documents d ON d.vault_id=p.vault_id AND d.current_version_id=p.version_id
+                   WHERE p.vault_id=? AND p.document_id=? AND p.ordinal=? AND d.deleted_at IS NULL""",
+                (vault_id, document_id, min(max(preview_index, 0), 119)),
+            ).fetchone()
+    if row and not Path(row["path"]).is_file():
+        with connect() as db, transaction(db, immediate=True):
+            db.execute(
+                "UPDATE versions SET visual_indexed_at=NULL,visual_model=NULL,visual_recovery_needed=1 WHERE vault_id=? AND id=(SELECT current_version_id FROM documents WHERE vault_id=? AND id=?)",
+                (vault_id, vault_id, document_id),
+            )
+            current = db.execute(
+                "SELECT current_version_id FROM documents WHERE vault_id=? AND id=?",
+                (vault_id, document_id),
+            ).fetchone()
+            if current and current["current_version_id"]:
+                db.execute(
+                    "DELETE FROM embedding_batches WHERE vault_id=? AND version_id=? AND modality='visual'",
+                    (vault_id, current["current_version_id"]),
+                )
+                create_job(db, vault_id, "delete_version_vectors", {"version_id": current["current_version_id"], "modality": "visual"}, priority=20)
     if not row or not Path(row["path"]).is_file():
         raise KeyError("No retained visual preview exists for that document/index")
     return Image(path=row["path"])
@@ -123,7 +147,17 @@ def collection_status() -> dict[str, Any]:
         sources = [dict(row) for row in db.execute("SELECT id,name,platform,root_label,online,last_seen_at,last_successful_sync_at FROM sources WHERE vault_id=?", (vault_id,))]
         states = [dict(row) for row in db.execute("SELECT state,COUNT(*) count FROM documents WHERE vault_id=? GROUP BY state", (vault_id,))]
         vault = dict(db.execute("SELECT embedding_model,visual_model,rerank_model,provider_ciphertext IS NOT NULL provider_configured FROM vaults WHERE id=?", (vault_id,)).fetchone())
-    return {"sources": sources, "documents": states, "storage": storage_usage(vault_id), "provider": vault}
+        readiness = dict(db.execute(
+            """SELECT COUNT(*) current_versions,
+                      SUM(CASE WHEN v.lexical_indexed_at IS NOT NULL THEN 1 ELSE 0 END) lexical_ready,
+                      SUM(CASE WHEN v.text_indexed_at IS NOT NULL AND v.embedding_model=x.embedding_model THEN 1 ELSE 0 END) text_ready,
+                      SUM(CASE WHEN v.visual_indexed_at IS NOT NULL AND v.visual_model=x.visual_model THEN 1 ELSE 0 END) visual_ready,
+                      SUM(CASE WHEN v.visual_recovery_needed=1 THEN 1 ELSE 0 END) visual_recovery_needed
+               FROM versions v JOIN documents d ON d.vault_id=v.vault_id AND d.current_version_id=v.id
+               JOIN vaults x ON x.id=v.vault_id WHERE v.vault_id=? AND d.deleted_at IS NULL""",
+            (vault_id,),
+        ).fetchone())
+    return {"sources": sources, "documents": states, "storage": storage_usage(vault_id), "provider": vault, "index_readiness": {key: int(value or 0) for key, value in readiness.items()}}
 
 
 def _safe_remote_url(url: str) -> None:
@@ -215,13 +249,16 @@ def save_chat_artifact(file: OpenAIFile, note: str | None = None) -> dict[str, A
     """Stage a chat file for the Windows connector to write into its configured Saved Artifacts folder."""
     vault_id = current_vault("write")
     path = _download_openai_file(file)
+    with path.open("rb") as staged:
+        digest = hashlib.file_digest(staged, "sha256").hexdigest()
+    size = path.stat().st_size
     artifact_id = "artifact_" + uuid.uuid4().hex
     expires = now() + settings().staging_ttl_hours * 3600
     with connect() as db:
         db.execute(
-            """INSERT INTO pending_artifacts(id,vault_id,file_name,media_type,staging_path,note_text,provenance_json,state,created_at,expires_at)
-               VALUES(?,?,?,?,?,?,?,?,?,?)""",
-            (artifact_id, vault_id, file.file_name or path.name, file.mime_type, str(path), note, json.dumps({"client": "chatgpt", "file_id": file.file_id, "received_at": now()}), "pending", now(), expires),
+            """INSERT INTO pending_artifacts(id,vault_id,file_name,media_type,artifact_kind,staging_path,note_text,content_sha256,content_size_bytes,provenance_json,state,created_at,expires_at)
+               VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (artifact_id, vault_id, file.file_name or path.name, file.mime_type, "file", str(path), note, digest, size, json.dumps({"client": "chatgpt", "file_id": file.file_id, "received_at": now()}), "pending", now(), expires),
         )
     return {"artifact_id": artifact_id, "state": "pending_source_delivery", "saved": False, "expires_at": expires, "message": "The connector must be online and confirm the original was written before this becomes saved."}
 
@@ -234,10 +271,11 @@ def save_chat_note(title: str, text: str, author_label: str = "user") -> dict[st
         raise ValueError("Note exceeds the 1 MiB limit")
     artifact_id = "artifact_" + uuid.uuid4().hex
     expires = now() + settings().staging_ttl_hours * 3600
+    raw = text.encode()
     with connect() as db:
         db.execute(
-            """INSERT INTO pending_artifacts(id,vault_id,file_name,media_type,note_text,provenance_json,state,created_at,expires_at)
-               VALUES(?,?,?,?,?,?,?,?,?)""",
-            (artifact_id, vault_id, f"{title}.md", "text/markdown", text, json.dumps({"author_label": author_label, "created_at": now(), "statement_type": "user_note"}), "pending", now(), expires),
+            """INSERT INTO pending_artifacts(id,vault_id,file_name,media_type,artifact_kind,note_text,content_sha256,content_size_bytes,provenance_json,state,created_at,expires_at)
+               VALUES(?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (artifact_id, vault_id, f"{title}.md", "text/markdown", "note", text, hashlib.sha256(raw).hexdigest(), len(raw), json.dumps({"author_label": author_label, "created_at": now(), "statement_type": "user_note"}), "pending", now(), expires),
         )
     return {"artifact_id": artifact_id, "state": "pending_source_delivery", "saved": False, "expires_at": expires}

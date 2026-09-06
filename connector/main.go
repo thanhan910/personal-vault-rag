@@ -23,7 +23,7 @@ import (
 	"time"
 )
 
-const version = "0.1.0"
+const version = "0.2.0"
 const maxFileBytes int64 = 256 * 1024 * 1024
 
 var supported = map[string]bool{".pdf": true, ".docx": true, ".pptx": true, ".xlsx": true, ".txt": true, ".md": true, ".markdown": true, ".png": true, ".jpg": true, ".jpeg": true, ".webp": true, ".tif": true, ".tiff": true, ".mp3": true, ".m4a": true, ".wav": true, ".flac": true, ".mp4": true, ".mov": true, ".mkv": true, ".webm": true}
@@ -67,9 +67,10 @@ func appDir() string {
 	}
 	return filepath.Join(base, "PersonalVault")
 }
-func configPath() string { return filepath.Join(appDir(), "config.json") }
-func statePath() string  { return filepath.Join(appDir(), "state.json") }
-func logsPath() string   { return filepath.Join(appDir(), "connector.log") }
+func configPath() string  { return filepath.Join(appDir(), "config.json") }
+func statePath() string   { return filepath.Join(appDir(), "state.json") }
+func logsPath() string    { return filepath.Join(appDir(), "connector.log") }
+func runtimePath() string { return filepath.Join(appDir(), "runtime-status.json") }
 func randomID(prefix string) string {
 	sum := sha256.Sum256([]byte(fmt.Sprintf("%d-%d-%s", time.Now().UnixNano(), os.Getpid(), prefix)))
 	return prefix + hex.EncodeToString(sum[:16])
@@ -99,6 +100,19 @@ func saveConfig(cfg Config, token string) error {
 	raw, _ := json.MarshalIndent(cfg, "", "  ")
 	return os.WriteFile(configPath(), raw, 0600)
 }
+
+func ensureConfigSources(cfg Config, token string) (Config, error) {
+	updated := ensureSavedDestinationSource(cfg.Sources, cfg.SaveDestination)
+	if len(updated) == len(cfg.Sources) {
+		return cfg, nil
+	}
+	cfg.Sources = updated
+	if err := saveConfig(cfg, token); err != nil {
+		return cfg, err
+	}
+	logf("registered Saved Artifacts destination as an indexed source")
+	return cfg, nil
+}
 func loadState() State {
 	state := State{Files: map[string]FileState{}}
 	raw, err := os.ReadFile(statePath())
@@ -124,6 +138,44 @@ func logf(format string, args ...any) {
 	if err == nil {
 		defer f.Close()
 		fmt.Fprintf(f, "%s "+format+"\n", append([]any{time.Now().Format(time.RFC3339)}, args...)...)
+	}
+}
+
+func writeRuntimeStatus(paused bool) {
+	raw, _ := json.MarshalIndent(map[string]any{
+		"pid": os.Getpid(), "effective_paused": paused, "updated_at": time.Now().Format(time.RFC3339),
+	}, "", "  ")
+	_ = os.WriteFile(runtimePath(), raw, 0600)
+}
+
+var configurationPollInterval = 5 * time.Second
+var readConfiguredPause = func() (bool, error) {
+	latest, _, err := loadConfig()
+	return latest.Paused, err
+}
+
+func waitForNextCycle(ctx context.Context, paused bool, interval time.Duration) bool {
+	deadline := time.Now().Add(interval)
+	for {
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			return true
+		}
+		wait := configurationPollInterval
+		if remaining < wait {
+			wait = remaining
+		}
+		timer := time.NewTimer(wait)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return false
+		case <-timer.C:
+			latestPaused, err := readConfiguredPause()
+			if err == nil && latestPaused != paused {
+				return true
+			}
+		}
 	}
 }
 
@@ -234,12 +286,30 @@ func setup() error {
 	if err != nil {
 		return err
 	}
+	sources = ensureSavedDestinationSource(sources, saveDest)
 	cfg := Config{BackendURL: strings.TrimRight(backend, "/"), VaultID: claim.VaultID, DeviceName: device, Sources: sources, SaveDestination: saveDest, IntervalMinutes: 10}
 	if err = saveConfig(cfg, claim.AccessToken); err != nil {
 		return err
 	}
 	fmt.Printf("Paired %d source(s). Configuration: %s\n", len(sources), configPath())
 	return nil
+}
+
+func pathWithinRoot(root, candidate string) bool {
+	relative, err := filepath.Rel(filepath.Clean(root), filepath.Clean(candidate))
+	if err != nil || relative == ".." || strings.HasPrefix(relative, ".."+string(filepath.Separator)) {
+		return false
+	}
+	return true
+}
+
+func ensureSavedDestinationSource(sources []Source, destination string) []Source {
+	for _, source := range sources {
+		if pathWithinRoot(source.Root, destination) {
+			return sources
+		}
+	}
+	return append(sources, Source{ID: randomID("src_"), Name: "Saved Chat Artifacts", Root: destination})
 }
 
 func registerSources(c *Client) error {
@@ -293,8 +363,12 @@ func upload(c *Client, source Source, path, rel string, info os.FileInfo, sha, d
 	defer resp.Body.Close()
 	return nil
 }
-func seen(c *Client, source Source, rel string, info os.FileInfo, state FileState, generation int64) error {
-	return c.json("POST", "/api/seen", map[string]any{"source_id": source.ID, "document_id": state.DocumentID, "relative_path": filepath.ToSlash(rel), "display_name": info.Name(), "mtime_ns": info.ModTime().UnixNano(), "size_bytes": info.Size(), "scan_generation": generation}, nil)
+func seen(c *Client, source Source, rel string, info os.FileInfo, state FileState, generation int64) (bool, error) {
+	var response struct {
+		NeedsContent bool `json:"needs_content"`
+	}
+	err := c.json("POST", "/api/seen", map[string]any{"source_id": source.ID, "document_id": state.DocumentID, "relative_path": filepath.ToSlash(rel), "display_name": info.Name(), "mtime_ns": info.ModTime().UnixNano(), "size_bytes": info.Size(), "scan_generation": generation}, &response)
+	return response.NeedsContent, err
 }
 
 func scan(c *Client) error {
@@ -336,13 +410,16 @@ func scan(c *Client) error {
 				key := source.ID + "|" + strings.ToLower(filepath.Clean(rel))
 				old, exists := state.Files[key]
 				if exists && old.Size == info.Size() && old.MtimeNS == info.ModTime().UnixNano() {
-					if err := seen(c, source, rel, info, old, generation); err != nil {
-						logf("seen failed %s: %v", path, err)
+					needsContent, seenErr := seen(c, source, rel, info, old, generation)
+					if seenErr != nil {
+						logf("seen failed %s: %v", path, seenErr)
 						complete = false
-					} else {
+					} else if !needsContent {
 						next.Files[key] = old
+						return nil
+					} else {
+						logf("source content requested for visual preview recovery: %s", path)
 					}
-					return nil
 				}
 				sha, err := hashFile(path)
 				if err != nil {
@@ -403,10 +480,12 @@ func scan(c *Client) error {
 }
 
 type Artifact struct {
-	ID       string  `json:"id"`
-	FileName string  `json:"file_name"`
-	NoteText *string `json:"note_text"`
-	HasFile  bool    `json:"has_file"`
+	ID               string  `json:"id"`
+	FileName         string  `json:"file_name"`
+	NoteText         *string `json:"note_text"`
+	HasFile          bool    `json:"has_file"`
+	ContentSHA256    string  `json:"content_sha256"`
+	ContentSizeBytes int64   `json:"content_size_bytes"`
 }
 
 func safeName(name string) string {
@@ -422,6 +501,116 @@ func safeName(name string) string {
 	}
 	return name
 }
+
+func artifactCandidate(name, artifactID string, attempt int) string {
+	if attempt == 0 {
+		return name
+	}
+	ext := filepath.Ext(name)
+	base := strings.TrimSuffix(name, ext)
+	suffix := strings.TrimPrefix(artifactID, "artifact_")
+	if len(suffix) > 12 {
+		suffix = suffix[:12]
+	}
+	if attempt > 1 {
+		suffix += fmt.Sprintf("-%d", attempt)
+	}
+	return base + "-" + suffix + ext
+}
+
+func fileMatches(path, expectedSHA string, expectedSize int64) bool {
+	info, err := os.Stat(path)
+	if err != nil || info.IsDir() || info.Size() != expectedSize {
+		return false
+	}
+	digest, err := hashFile(path)
+	return err == nil && strings.EqualFold(digest, expectedSHA)
+}
+
+func ensureAnnotation(target string, note *string) error {
+	if note == nil || *note == "" {
+		return nil
+	}
+	notePath := target + ".note.md"
+	noteRaw := []byte(*note)
+	noteDigest := sha256.Sum256(noteRaw)
+	expected := hex.EncodeToString(noteDigest[:])
+	if fileMatches(notePath, expected, int64(len(noteRaw))) {
+		return nil
+	}
+	noteFile, err := os.OpenFile(notePath, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0600)
+	if err != nil {
+		return err
+	}
+	_, err = noteFile.Write(noteRaw)
+	if closeErr := noteFile.Close(); err == nil {
+		err = closeErr
+	}
+	if err != nil {
+		_ = os.Remove(notePath)
+	}
+	return err
+}
+
+func writeArtifact(c *Client, artifact Artifact) (string, error) {
+	name := safeName(artifact.FileName)
+	for attempt := 0; attempt < 100; attempt++ {
+		relative := artifactCandidate(name, artifact.ID, attempt)
+		target := filepath.Join(c.Config.SaveDestination, relative)
+		if fileMatches(target, artifact.ContentSHA256, artifact.ContentSizeBytes) {
+			if err := ensureAnnotation(target, artifact.NoteText); errors.Is(err, os.ErrExist) {
+				continue
+			} else if err != nil {
+				return "", fmt.Errorf("attachment exists but annotation sidecar failed: %w", err)
+			}
+			return relative, nil
+		}
+		file, err := os.OpenFile(target, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0600)
+		if errors.Is(err, os.ErrExist) {
+			continue
+		}
+		if err != nil {
+			return "", err
+		}
+		hash := sha256.New()
+		var written int64
+		if artifact.HasFile {
+			response, requestErr := c.request("GET", "/api/connector/artifacts/"+url.PathEscape(artifact.ID)+"/content", nil, "")
+			if requestErr != nil {
+				err = requestErr
+			} else {
+				written, err = io.Copy(io.MultiWriter(file, hash), io.LimitReader(response.Body, maxFileBytes+1))
+				_ = response.Body.Close()
+			}
+		} else if artifact.NoteText != nil {
+			written, err = io.Copy(io.MultiWriter(file, hash), strings.NewReader(*artifact.NoteText))
+		} else {
+			err = errors.New("artifact has neither binary content nor note text")
+		}
+		if closeErr := file.Close(); err == nil {
+			err = closeErr
+		}
+		if err == nil && (written != artifact.ContentSizeBytes || !strings.EqualFold(hex.EncodeToString(hash.Sum(nil)), artifact.ContentSHA256)) {
+			err = errors.New("saved artifact fingerprint does not match server metadata")
+		}
+		if err != nil {
+			_ = os.Remove(target)
+			return "", err
+		}
+		if artifact.HasFile {
+			if noteErr := ensureAnnotation(target, artifact.NoteText); errors.Is(noteErr, os.ErrExist) {
+				_ = os.Remove(target)
+				continue
+			} else if noteErr != nil {
+				_ = os.Remove(target)
+				return "", fmt.Errorf("attachment annotation sidecar failed: %w", noteErr)
+			}
+		}
+		return relative, nil
+	}
+	return "", errors.New("could not allocate a collision-free artifact filename")
+}
+
 func deliverArtifacts(c *Client) error {
 	var listing struct {
 		Artifacts []Artifact `json:"artifacts"`
@@ -430,36 +619,9 @@ func deliverArtifacts(c *Client) error {
 		return err
 	}
 	for _, a := range listing.Artifacts {
-		name := safeName(a.FileName)
-		target := filepath.Join(c.Config.SaveDestination, name)
-		if _, err := os.Stat(target); err == nil {
-			ext := filepath.Ext(name)
-			target = filepath.Join(c.Config.SaveDestination, strings.TrimSuffix(name, ext)+"-"+time.Now().Format("20060102-150405")+ext)
-		}
-		var err error
-		if a.NoteText != nil {
-			err = os.WriteFile(target, []byte(*a.NoteText), 0600)
-		} else {
-			resp, e := c.request("GET", "/api/connector/artifacts/"+url.PathEscape(a.ID)+"/content", nil, "")
-			if e != nil {
-				err = e
-			} else {
-				f, e2 := os.OpenFile(target, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0600)
-				if e2 == nil {
-					var written int64
-					written, e2 = io.Copy(f, io.LimitReader(resp.Body, maxFileBytes+1))
-					if written > maxFileBytes {
-						e2 = errors.New("artifact exceeds byte limit")
-					}
-					_ = f.Close()
-				}
-				_ = resp.Body.Close()
-				err = e2
-			}
-		}
-		payload := map[string]any{"success": err == nil, "saved_relative_path": target}
+		relative, err := writeArtifact(c, a)
+		payload := map[string]any{"success": err == nil, "saved_relative_path": relative, "content_sha256": a.ContentSHA256, "content_size_bytes": a.ContentSizeBytes}
 		if err != nil {
-			_ = os.Remove(target)
 			payload["error"] = err.Error()
 			payload["saved_relative_path"] = nil
 		}
@@ -473,20 +635,34 @@ func run() error {
 	if err != nil {
 		return fmt.Errorf("run setup first: %w", err)
 	}
+	cfg, err = ensureConfigSources(cfg, token)
+	if err != nil {
+		return fmt.Errorf("upgrade configuration: %w", err)
+	}
 	client := &Client{Config: cfg, Token: token, HTTP: &http.Client{Timeout: 30 * time.Minute}}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	for {
-		if err = deliverArtifacts(client); err != nil {
-			logf("artifact delivery: %v", err)
+		cfg, token, err = loadConfig()
+		if err != nil {
+			return fmt.Errorf("reload configuration: %w", err)
 		}
-		if err = scan(client); err != nil {
-			logf("scan: %v", err)
+		cfg, err = ensureConfigSources(cfg, token)
+		if err != nil {
+			return fmt.Errorf("upgrade configuration: %w", err)
 		}
-		select {
-		case <-ctx.Done():
+		client.Config, client.Token = cfg, token
+		writeRuntimeStatus(cfg.Paused)
+		if !cfg.Paused {
+			if err = deliverArtifacts(client); err != nil {
+				logf("artifact delivery: %v", err)
+			}
+			if err = scan(client); err != nil {
+				logf("scan: %v", err)
+			}
+		}
+		if !waitForNextCycle(ctx, cfg.Paused, time.Duration(max(1, cfg.IntervalMinutes))*time.Minute) {
 			return nil
-		case <-time.After(time.Duration(max(1, cfg.IntervalMinutes)) * time.Minute):
 		}
 	}
 }
@@ -658,7 +834,12 @@ func main() {
 		if e != nil {
 			err = e
 		} else {
-			err = scan(&Client{Config: cfg, Token: token, HTTP: &http.Client{Timeout: 30 * time.Minute}})
+			cfg, e = ensureConfigSources(cfg, token)
+			if e != nil {
+				err = e
+			} else {
+				err = scan(&Client{Config: cfg, Token: token, HTTP: &http.Client{Timeout: 30 * time.Minute}})
+			}
 		}
 	case "pause":
 		cfg, token, e := loadConfig()
@@ -679,7 +860,20 @@ func main() {
 	case "status":
 		cfg, _, e := loadConfig()
 		if e == nil {
-			raw, _ := json.MarshalIndent(cfg, "", "  ")
+			var runtime any
+			if runtimeRaw, readErr := os.ReadFile(runtimePath()); readErr == nil {
+				_ = json.Unmarshal(runtimeRaw, &runtime)
+			}
+			raw, _ := json.MarshalIndent(map[string]any{
+				"backend_url":       cfg.BackendURL,
+				"vault_id":          cfg.VaultID,
+				"device_name":       cfg.DeviceName,
+				"sources":           cfg.Sources,
+				"save_destination":  cfg.SaveDestination,
+				"configured_paused": cfg.Paused,
+				"interval_minutes":  cfg.IntervalMinutes,
+				"runtime":           runtime,
+			}, "", "  ")
 			fmt.Println(string(raw))
 		} else {
 			err = e

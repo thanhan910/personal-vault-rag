@@ -7,6 +7,15 @@ stage_dir="$repo_dir/build/windows-package"
 
 mkdir -p "$dist_dir" "$stage_dir" "$repo_dir/packaging/claude-extension/server"
 docker run --rm --network none \
+  -v "$repo_dir/connector:/src:ro" \
+  -w /src golang:1.24.6-bookworm \
+  go test ./...
+docker run --rm --network none \
+  -e CGO_ENABLED=0 -e GOOS=windows -e GOARCH=amd64 \
+  -v "$repo_dir/connector:/src:ro" -v "$stage_dir:/out" \
+  -w /src golang:1.24.6-bookworm \
+  go test -c -o /out/personal-vault-connector-tests.exe .
+docker run --rm --network none \
   -e CGO_ENABLED=0 -e GOOS=windows -e GOARCH=amd64 \
   -v "$repo_dir/connector:/src:ro" -v "$stage_dir:/out" \
   -w /src golang:1.24.6-bookworm \

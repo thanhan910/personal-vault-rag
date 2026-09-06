@@ -4,7 +4,7 @@ services:
   api:
     build:
       context: .
-    image: personal-vault-rag:0.1.0
+    image: personal-vault-rag:0.2.0
     command: ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "5001", "--proxy-headers", "--forwarded-allow-ips", "*"]
     env_file: .env
     environment:
@@ -41,7 +41,7 @@ services:
       start_period: 30s
 
   worker:
-    image: personal-vault-rag:0.1.0
+    image: personal-vault-rag:0.2.0
     command: ["python", "-m", "app.worker"]
     env_file: .env
     environment:

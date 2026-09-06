@@ -104,17 +104,36 @@ def main() -> int:
         raise SystemExit("evaluation timed out waiting for queued work")
 
     checks = {}
-    for name, question, expected in (
-        ("exact_identifier", "What is PVR-TECH-7Q9X?", "PVR-TECH-7Q9X"),
-        ("vietnamese", "Ngân sách dự án Sen Vàng là bao nhiêu?", "420 triệu đồng"),
-        ("conflict", "What are the conflicting Aurora launch dates?", "October"),
-        ("multi_document", "Who owns work under programme Juniper?", "Juniper"),
+    for name, question, expected_terms in (
+        ("exact_identifier", "What is PVR-TECH-7Q9X?", ("PVR-TECH-7Q9X",)),
+        ("vietnamese", "Ngân sách dự án Sen Vàng là bao nhiêu?", ("420 triệu đồng",)),
+        ("conflict", "What are the conflicting Aurora launch dates?", ("3 September 2026", "14 October 2026")),
+        ("multi_document", "Who owns work under programme Juniper?", ("North site", "South site")),
     ):
         result = client.post("/api/search", json={"question": question, "limit": 8}).json()
         joined = " ".join(item["preview"] for item in result["results"])
-        checks[name] = {"passed": expected.casefold() in joined.casefold(), "result_count": len(result["results"]), "citations_have_ids": all(item["document_id"] and item["version_id"] and item["chunk_id"] for item in result["results"])}
+        complete_citations = bool(result["results"]) and all(
+            item["document_id"] and item["version_id"] and item["chunk_id"] and item["locator"] is not None
+            for item in result["results"]
+        )
+        checks[name] = {
+            "passed": all(term.casefold() in joined.casefold() for term in expected_terms) and complete_citations,
+            "required_terms": expected_terms,
+            "result_count": len(result["results"]),
+            "citations_have_ids_and_locators": complete_citations,
+        }
     absent = client.post("/api/search", json={"question": "MARIGOLD-UNLISTED-404", "limit": 5}).json()
-    checks["unanswerable"] = {"passed": not absent["results"], "warnings": absent["warnings"]}
+    absent_text = " ".join(item["preview"] for item in absent["results"])
+    explicit_caution = any(
+        "No supporting evidence" in warning or "require relevance validation" in warning
+        for warning in absent["warnings"]
+    )
+    checks["unanswerable"] = {
+        "passed": "MARIGOLD-UNLISTED-404" not in absent_text and explicit_caution,
+        "result_count": len(absent["results"]),
+        "warnings": absent["warnings"],
+        "note": "Nearest-neighbour results are allowed, but must be explicitly cautioned and cannot contain invented support.",
+    }
 
     search_costs = client.post("/api/search", json={"question": "Alpha Beta Gamma AUD Costs", "limit": 5}).json()
     spreadsheet = next((item for item in search_costs["results"] if item["title"] == "costs.xlsx"), None)

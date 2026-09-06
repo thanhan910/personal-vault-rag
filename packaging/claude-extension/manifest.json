@@ -2,7 +2,7 @@
   "manifest_version": "0.3",
   "name": "personal-vault",
   "display_name": "Personal Vault",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Search and save notes to a paired personal document vault.",
   "long_description": "Uses the Personal Vault Connector configuration already paired on this Windows account. Search results include stable document and revision IDs with precise evidence locators.",
   "author": {"name": "Personal Vault project"},

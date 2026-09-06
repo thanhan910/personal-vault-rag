@@ -95,6 +95,10 @@ CREATE TABLE IF NOT EXISTS versions (
   visual_model TEXT,
   created_at REAL NOT NULL,
   indexed_at REAL,
+  lexical_indexed_at REAL,
+  text_indexed_at REAL,
+  visual_indexed_at REAL,
+  visual_recovery_needed INTEGER NOT NULL DEFAULT 0,
   raw_staging_path TEXT,
   raw_expires_at REAL,
   text_bytes INTEGER NOT NULL DEFAULT 0,
@@ -144,8 +148,22 @@ CREATE TABLE IF NOT EXISTS previews (
   ordinal INTEGER NOT NULL,
   path TEXT NOT NULL,
   media_type TEXT NOT NULL,
+  locator_json TEXT NOT NULL DEFAULT '{}',
+  text_chunk_id TEXT,
   created_at REAL NOT NULL,
   PRIMARY KEY (vault_id, id),
+  FOREIGN KEY (vault_id, version_id) REFERENCES versions(vault_id, id) ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS embedding_batches (
+  vault_id TEXT NOT NULL,
+  version_id TEXT NOT NULL,
+  modality TEXT NOT NULL,
+  batch_start INTEGER NOT NULL,
+  model TEXT NOT NULL,
+  item_count INTEGER NOT NULL,
+  completed_at REAL NOT NULL,
+  PRIMARY KEY (vault_id, version_id, modality, batch_start, model),
   FOREIGN KEY (vault_id, version_id) REFERENCES versions(vault_id, id) ON DELETE CASCADE
 );
 
@@ -182,6 +200,8 @@ CREATE TABLE IF NOT EXISTS usage_ledger (
   reserved_microusd INTEGER NOT NULL,
   actual_microusd INTEGER,
   state TEXT NOT NULL,
+  logical_key TEXT,
+  uncertainty_reason TEXT,
   created_at REAL NOT NULL,
   completed_at REAL,
   request_key TEXT,
@@ -193,14 +213,19 @@ CREATE TABLE IF NOT EXISTS pending_artifacts (
   vault_id TEXT NOT NULL REFERENCES vaults(id) ON DELETE CASCADE,
   file_name TEXT NOT NULL,
   media_type TEXT,
+  artifact_kind TEXT NOT NULL DEFAULT 'note',
   staging_path TEXT,
   note_text TEXT,
+  content_sha256 TEXT,
+  content_size_bytes INTEGER,
   provenance_json TEXT NOT NULL,
   state TEXT NOT NULL DEFAULT 'pending',
   created_at REAL NOT NULL,
   expires_at REAL NOT NULL,
   claimed_at REAL,
   completed_at REAL,
+  saved_relative_path TEXT,
+  delivery_attempts INTEGER NOT NULL DEFAULT 0,
   error TEXT
 );
 
@@ -241,6 +266,7 @@ CREATE INDEX IF NOT EXISTS idx_versions_doc ON versions(vault_id, document_id, c
 CREATE INDEX IF NOT EXISTS idx_chunks_doc ON chunks(vault_id, document_id, version_id, ordinal);
 CREATE INDEX IF NOT EXISTS idx_table_cells_range ON table_cells(vault_id,document_id,version_id,sheet_name,row_number,column_number);
 CREATE INDEX IF NOT EXISTS idx_previews_version ON previews(vault_id,version_id,ordinal);
+CREATE INDEX IF NOT EXISTS idx_embedding_batches_version ON embedding_batches(vault_id,version_id,modality,model);
 CREATE INDEX IF NOT EXISTS idx_jobs_claim ON jobs(state, not_before, priority, created_at);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_jobs_active_unique ON jobs(vault_id,kind,payload_json) WHERE state IN ('queued','running');
 CREATE INDEX IF NOT EXISTS idx_usage_month ON usage_ledger(vault_id, created_at, state);
@@ -265,6 +291,43 @@ def init_db(path: Path | None = None) -> None:
         oauth_columns = {row["name"] for row in db.execute("PRAGMA table_info(oauth_codes)")}
         if "scope" not in oauth_columns:
             db.execute("ALTER TABLE oauth_codes ADD COLUMN scope TEXT NOT NULL DEFAULT 'search'")
+        version_columns = {row["name"] for row in db.execute("PRAGMA table_info(versions)")}
+        for name, declaration in (
+            ("lexical_indexed_at", "REAL"),
+            ("text_indexed_at", "REAL"),
+            ("visual_indexed_at", "REAL"),
+            ("visual_recovery_needed", "INTEGER NOT NULL DEFAULT 0"),
+        ):
+            if name not in version_columns:
+                db.execute(f"ALTER TABLE versions ADD COLUMN {name} {declaration}")
+        if "lexical_indexed_at" not in version_columns:
+            db.execute("UPDATE versions SET lexical_indexed_at=indexed_at,embedding_model=NULL,visual_model=NULL")
+        preview_columns = {row["name"] for row in db.execute("PRAGMA table_info(previews)")}
+        if "locator_json" not in preview_columns:
+            db.execute("ALTER TABLE previews ADD COLUMN locator_json TEXT NOT NULL DEFAULT '{}'")
+        if "text_chunk_id" not in preview_columns:
+            db.execute("ALTER TABLE previews ADD COLUMN text_chunk_id TEXT")
+            db.execute(
+                """UPDATE versions SET visual_indexed_at=NULL,visual_model=NULL,visual_recovery_needed=1
+                   WHERE EXISTS(SELECT 1 FROM previews p WHERE p.vault_id=versions.vault_id AND p.version_id=versions.id)"""
+            )
+        usage_columns = {row["name"] for row in db.execute("PRAGMA table_info(usage_ledger)")}
+        if "logical_key" not in usage_columns:
+            db.execute("ALTER TABLE usage_ledger ADD COLUMN logical_key TEXT")
+        if "uncertainty_reason" not in usage_columns:
+            db.execute("ALTER TABLE usage_ledger ADD COLUMN uncertainty_reason TEXT")
+        artifact_columns = {row["name"] for row in db.execute("PRAGMA table_info(pending_artifacts)")}
+        for name, declaration in (
+            ("artifact_kind", "TEXT NOT NULL DEFAULT 'note'"),
+            ("content_sha256", "TEXT"),
+            ("content_size_bytes", "INTEGER"),
+            ("saved_relative_path", "TEXT"),
+            ("delivery_attempts", "INTEGER NOT NULL DEFAULT 0"),
+        ):
+            if name not in artifact_columns:
+                db.execute(f"ALTER TABLE pending_artifacts ADD COLUMN {name} {declaration}")
+        if "artifact_kind" not in artifact_columns:
+            db.execute("UPDATE pending_artifacts SET artifact_kind=CASE WHEN staging_path IS NOT NULL THEN 'file' ELSE 'note' END")
 
 
 @contextlib.contextmanager

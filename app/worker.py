@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import socket
 import time
 import traceback
@@ -11,13 +12,12 @@ from pathlib import Path
 from PIL import Image
 from openpyxl import load_workbook
 
-from .budget import BudgetUnavailable
-from .catalog import cleanup_expired
+from .catalog import cleanup_expired, create_job, enqueue_missing_embedding_jobs
 from .config import settings
 from .db import connect, init_db, now, transaction
 from .extraction import extract_document
 from .provider import embed_texts, embed_visual_inputs, provider_settings
-from .retrieval import delete_document_vectors, upsert_text_vectors, upsert_visual_vectors
+from .retrieval import delete_document_vectors, delete_version_vectors, mark_document_vectors_historical, upsert_text_vectors, upsert_visual_vectors
 
 
 WORKER_ID = f"{socket.gethostname()}:{os.getpid()}:{uuid.uuid4().hex[:8]}"
@@ -120,11 +120,94 @@ def _replace_table_cells(vault_id: str, document_id: str, version_id: str, raw_p
         )
 
 
+def _locator_matches(preview_locator: dict, chunk_locator: dict) -> bool:
+    if "page" in preview_locator and "page" in chunk_locator:
+        return chunk_locator["page"] <= preview_locator["page"] <= chunk_locator.get("page_end", chunk_locator["page"])
+    if "slide" in preview_locator and "slide" in chunk_locator:
+        return preview_locator["slide"] == chunk_locator["slide"]
+    if "image" in preview_locator and "image" in chunk_locator:
+        return preview_locator["image"] == chunk_locator["image"]
+    if "time_start" in preview_locator and "time_start" in chunk_locator:
+        return preview_locator.get("time_end", preview_locator["time_start"]) >= chunk_locator["time_start"] and preview_locator["time_start"] <= chunk_locator.get("time_end", chunk_locator["time_start"])
+    return False
+
+
+def _replace_visual_evidence(vault_id: str, document_id: str, version_id: str, previews, text_records: list[dict]) -> list[dict]:
+    stamp = now()
+    visual_records = []
+    preview_records = []
+    for index, preview in enumerate(previews):
+        nearby = next(
+            (record for record in text_records if _locator_matches(preview.locator, json.loads(record["locator_json"]))),
+            None,
+        )
+        chunk_id = "chk_" + uuid.uuid5(uuid.NAMESPACE_URL, f"{version_id}:visual:{index}").hex
+        preview_id = "preview_" + uuid.uuid5(uuid.NAMESPACE_URL, f"{version_id}:preview:{index}").hex
+        visual_records.append(
+            {
+                "id": chunk_id,
+                "vault_id": vault_id,
+                "document_id": document_id,
+                "version_id": version_id,
+                "ordinal": len(text_records) + index,
+                "kind": "visual",
+                "heading_path": nearby["heading_path"] if nearby else "Visual evidence",
+                "locator_json": json.dumps(preview.locator, ensure_ascii=False),
+                "text": "Visual evidence is available; inspect the identified preview before making a visual claim.",
+                "contextual_text": nearby["text"][:1200] if nearby else None,
+                "token_estimate": 1,
+                "created_at": stamp,
+            }
+        )
+        preview_records.append(
+            (
+                preview_id,
+                vault_id,
+                document_id,
+                version_id,
+                index,
+                str(preview.path),
+                "image/" + ("webp" if preview.path.suffix.casefold() == ".webp" else "jpeg"),
+                json.dumps(preview.locator, ensure_ascii=False),
+                chunk_id,
+                stamp,
+            )
+        )
+    with connect() as db, transaction(db, immediate=True):
+        db.execute("DELETE FROM previews WHERE vault_id=? AND version_id=?", (vault_id, version_id))
+        db.execute("DELETE FROM chunks WHERE vault_id=? AND version_id=? AND kind='visual'", (vault_id, version_id))
+        db.executemany(
+            """INSERT INTO chunks(id,vault_id,document_id,version_id,ordinal,kind,heading_path,locator_json,text,contextual_text,token_estimate,created_at)
+               VALUES(:id,:vault_id,:document_id,:version_id,:ordinal,:kind,:heading_path,:locator_json,:text,:contextual_text,:token_estimate,:created_at)""",
+            visual_records,
+        )
+        db.executemany(
+            """INSERT INTO previews(id,vault_id,document_id,version_id,ordinal,path,media_type,locator_json,text_chunk_id,created_at)
+               VALUES(?,?,?,?,?,?,?,?,?,?)""",
+            preview_records,
+        )
+    return visual_records
+
+
+def _preview_bytes(previews) -> int:
+    return sum(preview.path.stat().st_size for preview in previews if preview.path.exists())
+
+
+def _media_filters(media_type: str | None) -> list[str]:
+    value = (media_type or "application/octet-stream").casefold()
+    return list(dict.fromkeys((value, value.split("/", 1)[0])))
+
+
+def _path_prefixes(relative_path: str) -> list[str]:
+    parts = [part for part in relative_path.replace("\\", "/").strip("/").casefold().split("/") if part]
+    return ["/".join(parts[:index]) for index in range(1, len(parts) + 1)]
+
+
 def process_extract(job: dict) -> None:
     payload = json.loads(job["payload_json"])
     with connect() as db:
         row = db.execute(
-            """SELECT v.*,d.display_name,d.size_bytes FROM versions v JOIN documents d
+            """SELECT v.*,d.display_name,d.size_bytes,d.source_id,d.media_type,d.relative_path FROM versions v JOIN documents d
                ON d.vault_id=v.vault_id AND d.id=v.document_id WHERE v.vault_id=? AND v.id=? AND d.id=?""",
             (job["vault_id"], payload["version_id"], payload["document_id"]),
         ).fetchone()
@@ -132,54 +215,21 @@ def process_extract(job: dict) -> None:
         raise RuntimeError("Staged source is no longer available; reconnect the source to retry")
     raw_path = Path(row["raw_staging_path"])
     preview_dir = settings().preview_dir / job["vault_id"] / payload["version_id"]
+    shutil.rmtree(preview_dir, ignore_errors=True)
     extracted = extract_document(raw_path, row["display_name"], preview_dir)
     records = _replace_chunks(job["vault_id"], payload["document_id"], payload["version_id"], extracted)
     _replace_table_cells(job["vault_id"], payload["document_id"], payload["version_id"], raw_path, row["display_name"])
     warnings = list(extracted.warnings)
-    provider = provider_settings(job["vault_id"])
-    try:
-        for start in range(0, len(records), 64):
-            batch = records[start:start + 64]
-            vectors = embed_texts(
-                job["vault_id"], [item["text"] for item in batch], "document",
-                f"embed:{payload['version_id']}:{start}:{provider['embedding_model']}",
-            )
-            upsert_text_vectors(job["vault_id"], batch, vectors, provider["embedding_dimensions"])
-    except BudgetUnavailable as exc:
-        warnings.append(f"Dense indexing pending: {exc}")
-    visual_items = []
-    visual_inputs = []
-    for index, preview in enumerate(extracted.previews):
-        if not records:
-            break
-        with Image.open(preview) as image:
-            visual_inputs.append([[records[min(index, len(records)-1)]["text"][:500], image.convert("RGB").copy()]][0])
-        visual_items.append({
-            "id": f"visual:{payload['version_id']}:{index}", "chunk_id": records[min(index, len(records)-1)]["id"],
-            "document_id": payload["document_id"], "version_id": payload["version_id"], "preview_path": str(preview),
-        })
-    if visual_items:
-        try:
-            for start in range(0, len(visual_items), 8):
-                vectors = embed_visual_inputs(job["vault_id"], visual_inputs[start:start+8], "document", f"visual:{payload['version_id']}:{start}:{provider['visual_model']}")
-                upsert_visual_vectors(job["vault_id"], visual_items[start:start+8], vectors, provider["embedding_dimensions"])
-        except BudgetUnavailable as exc:
-            warnings.append(f"Visual indexing pending: {exc}")
-    with connect() as db, transaction(db, immediate=True):
-        db.execute("DELETE FROM previews WHERE vault_id=? AND version_id=?", (job["vault_id"], payload["version_id"]))
-        db.executemany(
-            """INSERT INTO previews(id,vault_id,document_id,version_id,ordinal,path,media_type,created_at)
-               VALUES(?,?,?,?,?,?,?,?)""",
-            [(f"preview_{uuid.uuid5(uuid.NAMESPACE_URL, str(path)).hex}", job["vault_id"], payload["document_id"], payload["version_id"], index, str(path), "image/" + ("webp" if path.suffix.casefold() == ".webp" else "jpeg"), now()) for index, path in enumerate(extracted.previews)],
-        )
+    _replace_visual_evidence(job["vault_id"], payload["document_id"], payload["version_id"], extracted.previews, records)
     raw_path.unlink(missing_ok=True)
     text_bytes = sum(len(item["text"].encode()) for item in records)
-    preview_bytes = sum(path.stat().st_size for path in extracted.previews if path.exists())
+    preview_bytes = _preview_bytes(extracted.previews)
     with connect() as db, transaction(db, immediate=True):
         db.execute(
-            """UPDATE versions SET indexed_at=?,embedding_model=?,visual_model=?,raw_staging_path=NULL,
+            """UPDATE versions SET indexed_at=?,lexical_indexed_at=?,embedding_model=NULL,visual_model=NULL,
+               text_indexed_at=NULL,visual_indexed_at=NULL,visual_recovery_needed=0,raw_staging_path=NULL,
                text_bytes=?,preview_bytes=? WHERE vault_id=? AND id=?""",
-            (now(), provider["embedding_model"], provider["visual_model"], text_bytes, preview_bytes, job["vault_id"], payload["version_id"]),
+            (now(), now(), text_bytes, preview_bytes, job["vault_id"], payload["version_id"]),
         )
         db.execute(
             """UPDATE documents SET current_version_id=?,state='indexed',error=? WHERE vault_id=? AND id=?""",
@@ -198,6 +248,169 @@ def process_extract(job: dict) -> None:
             """DELETE FROM jobs WHERE vault_id=? AND kind='extract' AND state='failed'
                AND json_extract(payload_json,'$.document_id')=?""",
             (job["vault_id"], payload["document_id"]),
+        )
+        create_job(db, job["vault_id"], "mark_historical", {"document_id": payload["document_id"], "current_version_id": payload["version_id"]}, priority=30)
+    enqueue_missing_embedding_jobs(job["vault_id"], payload["version_id"])
+
+
+def process_render_visual(job: dict) -> None:
+    payload = json.loads(job["payload_json"])
+    with connect() as db:
+        row = db.execute(
+            """SELECT v.raw_staging_path,d.display_name FROM versions v JOIN documents d
+               ON d.vault_id=v.vault_id AND d.id=v.document_id
+               WHERE v.vault_id=? AND v.id=? AND d.id=? AND d.current_version_id=v.id AND d.deleted_at IS NULL""",
+            (job["vault_id"], payload["version_id"], payload["document_id"]),
+        ).fetchone()
+        text_records = [dict(item) for item in db.execute(
+            "SELECT * FROM chunks WHERE vault_id=? AND version_id=? AND kind<>'visual' ORDER BY ordinal",
+            (job["vault_id"], payload["version_id"]),
+        )]
+    if not row or not row["raw_staging_path"]:
+        raise RuntimeError("Source content is required to regenerate expired visual previews")
+    raw_path = Path(row["raw_staging_path"])
+    preview_dir = settings().preview_dir / job["vault_id"] / payload["version_id"]
+    shutil.rmtree(preview_dir, ignore_errors=True)
+    extracted = extract_document(raw_path, row["display_name"], preview_dir)
+    delete_version_vectors(job["vault_id"], payload["version_id"], "visual")
+    with connect() as db:
+        db.execute(
+            "DELETE FROM embedding_batches WHERE vault_id=? AND version_id=? AND modality='visual'",
+            (job["vault_id"], payload["version_id"]),
+        )
+    _replace_visual_evidence(job["vault_id"], payload["document_id"], payload["version_id"], extracted.previews, text_records)
+    raw_path.unlink(missing_ok=True)
+    with connect() as db:
+        db.execute(
+            """UPDATE versions SET raw_staging_path=NULL,preview_bytes=?,visual_indexed_at=NULL,visual_model=NULL,
+               visual_recovery_needed=0 WHERE vault_id=? AND id=?""",
+            (_preview_bytes(extracted.previews), job["vault_id"], payload["version_id"]),
+        )
+    enqueue_missing_embedding_jobs(job["vault_id"], payload["version_id"])
+
+
+def process_embed_text(job: dict) -> None:
+    payload = json.loads(job["payload_json"])
+    provider = provider_settings(job["vault_id"])
+    if not provider or payload["model"] != provider["embedding_model"]:
+        return
+    with connect() as db:
+        version = db.execute(
+            """SELECT v.id,d.id document_id,d.source_id,d.media_type,d.relative_path FROM versions v JOIN documents d
+               ON d.vault_id=v.vault_id AND d.current_version_id=v.id
+               WHERE v.vault_id=? AND v.id=? AND d.deleted_at IS NULL""",
+            (job["vault_id"], payload["version_id"]),
+        ).fetchone()
+        records = [dict(item) for item in db.execute(
+            "SELECT * FROM chunks WHERE vault_id=? AND version_id=? AND kind<>'visual' AND text<>'' ORDER BY ordinal",
+            (job["vault_id"], payload["version_id"]),
+        )]
+    if not version or not records:
+        return
+    for record in records:
+        record["source_id"] = version["source_id"]
+        record["media_filters"] = _media_filters(version["media_type"])
+        record["path_prefixes"] = _path_prefixes(version["relative_path"])
+    for start in range(0, len(records), 64):
+        with connect() as db:
+            done = db.execute(
+                "SELECT 1 FROM embedding_batches WHERE vault_id=? AND version_id=? AND modality='text' AND batch_start=? AND model=?",
+                (job["vault_id"], payload["version_id"], start, payload["model"]),
+            ).fetchone()
+        if done:
+            continue
+        batch = records[start:start + 64]
+        vectors = embed_texts(job["vault_id"], [item["text"] for item in batch], "document", f"embed:{payload['version_id']}:{start}:{payload['model']}")
+        upsert_text_vectors(job["vault_id"], batch, vectors, provider["embedding_dimensions"])
+        with connect() as db:
+            db.execute(
+                "INSERT OR IGNORE INTO embedding_batches(vault_id,version_id,modality,batch_start,model,item_count,completed_at) VALUES(?,?,'text',?,?,?,?)",
+                (job["vault_id"], payload["version_id"], start, payload["model"], len(batch), now()),
+            )
+    with connect() as db:
+        db.execute(
+            "UPDATE versions SET text_indexed_at=?,embedding_model=? WHERE vault_id=? AND id=?",
+            (now(), payload["model"], job["vault_id"], payload["version_id"]),
+        )
+
+
+def process_embed_visual(job: dict) -> None:
+    payload = json.loads(job["payload_json"])
+    provider = provider_settings(job["vault_id"])
+    if not provider or payload["model"] != provider["visual_model"]:
+        return
+    with connect() as db:
+        version = db.execute(
+            """SELECT v.id,d.id document_id,d.source_id,d.media_type,d.relative_path FROM versions v JOIN documents d
+               ON d.vault_id=v.vault_id AND d.current_version_id=v.id
+               WHERE v.vault_id=? AND v.id=? AND d.deleted_at IS NULL""",
+            (job["vault_id"], payload["version_id"]),
+        ).fetchone()
+        rows = [dict(item) for item in db.execute(
+            """SELECT p.*,c.contextual_text,c.text FROM previews p JOIN chunks c
+               ON c.vault_id=p.vault_id AND c.id=p.text_chunk_id
+               WHERE p.vault_id=? AND p.version_id=? ORDER BY p.ordinal""",
+            (job["vault_id"], payload["version_id"]),
+        )]
+    if not version or not rows:
+        return
+    if any(not Path(row["path"]).is_file() for row in rows):
+        with connect() as db:
+            db.execute(
+                "DELETE FROM embedding_batches WHERE vault_id=? AND version_id=? AND modality='visual'",
+                (job["vault_id"], payload["version_id"]),
+            )
+            db.execute(
+                "UPDATE versions SET visual_indexed_at=NULL,visual_model=NULL,visual_recovery_needed=1 WHERE vault_id=? AND id=?",
+                (job["vault_id"], payload["version_id"]),
+            )
+        delete_version_vectors(job["vault_id"], payload["version_id"], "visual")
+        return
+    for start in range(0, len(rows), 8):
+        with connect() as db:
+            done = db.execute(
+                "SELECT 1 FROM embedding_batches WHERE vault_id=? AND version_id=? AND modality='visual' AND batch_start=? AND model=?",
+                (job["vault_id"], payload["version_id"], start, payload["model"]),
+            ).fetchone()
+        if done:
+            continue
+        batch_rows = rows[start:start + 8]
+        inputs = []
+        items = []
+        for row in batch_rows:
+            with Image.open(row["path"]) as image:
+                parts: list[object] = []
+                nearby = row["contextual_text"]
+                if nearby:
+                    parts.append(nearby[:1200])
+                parts.append(image.convert("RGB").copy())
+            inputs.append(parts)
+            items.append(
+                {
+                    "id": f"visual:{payload['version_id']}:{row['ordinal']}",
+                    "chunk_id": row["text_chunk_id"],
+                    "document_id": version["document_id"],
+                    "version_id": payload["version_id"],
+                    "preview_path": row["path"],
+                    "preview_id": row["id"],
+                    "preview_ordinal": row["ordinal"],
+                    "locator_json": row["locator_json"],
+                    "source_id": version["source_id"],
+                    "media_filters": _media_filters(version["media_type"]),
+                    "path_prefixes": _path_prefixes(version["relative_path"]),
+                }
+            )
+        vectors = embed_visual_inputs(job["vault_id"], inputs, "document", f"visual:{payload['version_id']}:{start}:{payload['model']}")
+        upsert_visual_vectors(job["vault_id"], items, vectors, provider["embedding_dimensions"])
+        with connect() as db:
+            db.execute(
+                "INSERT OR IGNORE INTO embedding_batches(vault_id,version_id,modality,batch_start,model,item_count,completed_at) VALUES(?,?,'visual',?,?,?,?)",
+                (job["vault_id"], payload["version_id"], start, payload["model"], len(items), now()),
+            )
+    with connect() as db:
+        db.execute(
+            "UPDATE versions SET visual_indexed_at=?,visual_model=?,visual_recovery_needed=0 WHERE vault_id=? AND id=?",
+            (now(), payload["model"], job["vault_id"], payload["version_id"]),
         )
 
 
@@ -235,11 +448,23 @@ def process_temporary_inspection(job: dict) -> None:
 def process_job(job: dict) -> None:
     if job["kind"] == "extract":
         process_extract(job)
+    elif job["kind"] == "render_visual":
+        process_render_visual(job)
+    elif job["kind"] == "embed_text":
+        process_embed_text(job)
+    elif job["kind"] == "embed_visual":
+        process_embed_visual(job)
+    elif job["kind"] == "mark_historical":
+        payload = json.loads(job["payload_json"])
+        mark_document_vectors_historical(job["vault_id"], payload["document_id"], payload["current_version_id"])
     elif job["kind"] == "inspect_temporary":
         process_temporary_inspection(job)
     elif job["kind"] == "delete_vectors":
         payload = json.loads(job["payload_json"])
         delete_document_vectors(job["vault_id"], payload["document_id"])
+    elif job["kind"] == "delete_version_vectors":
+        payload = json.loads(job["payload_json"])
+        delete_version_vectors(job["vault_id"], payload["version_id"], payload.get("modality"))
     elif job["kind"] == "cleanup":
         cleanup_expired()
     else:
@@ -248,6 +473,10 @@ def process_job(job: dict) -> None:
 
 def main() -> None:
     init_db()
+    with connect() as db:
+        vault_ids = [row["id"] for row in db.execute("SELECT id FROM vaults WHERE provider_ciphertext IS NOT NULL AND monthly_budget_microusd>0")]
+    for vault_id in vault_ids:
+        enqueue_missing_embedding_jobs(vault_id)
     last_cleanup = 0.0
     while True:
         job = claim_job()
