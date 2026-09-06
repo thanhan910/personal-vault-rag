@@ -13,6 +13,8 @@ The connector is a single Windows x86-64 executable. It needs no Docker, Python,
 
 3. Enter the private setup URL and pairing code shown by the Vault admin page. Select one or more source folders, then select the destination for explicitly saved chat artifacts. If that destination is not already beneath a selected root, setup registers it as an additional indexed source.
 
+To upgrade an existing installation, extract the new ZIP and run its `install.ps1` again. It stops the existing scheduled task, replaces the executable, preserves the pairing and selected folders in `config.json`, recreates the task and starts it. Delete the existing configuration first only when you intentionally want to pair again.
+
 The connector reads only selected roots. UNC paths and mapped network drives work while available. Opening a cloud placeholder may ask the sync client to download it and therefore uses laptop disk; an unavailable placeholder is reported, not marked indexed. Google-native cloud documents that exist only as link/placeholder metadata require export and are unsupported until a provider adapter is added.
 
 Pause with `%LOCALAPPDATA%\PersonalVault\personal-vault-connector.exe pause`; resume with the same command ending in `resume`. The daemon observes changes during idle waits within five seconds and applies them before the next scan; `status` reports configured and last effective state. `uninstall.ps1` removes the scheduled task but deliberately leaves recoverable configuration. Logs are under `%LOCALAPPDATA%\PersonalVault`.

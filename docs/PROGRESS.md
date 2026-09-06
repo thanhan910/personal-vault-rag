@@ -6,7 +6,7 @@
 - Docling/OCR/Office extraction, structured XLSX cells, PDF/image previews, faster-whisper timestamps and bounded video sampling.
 - Hybrid rank fusion/rerank path, adjacent fetch, visual inspection, precise version/locator results and signed private viewers.
 - OAuth 2.0 PKCE remote MCP plus Windows local stdio MCP, queued attachment inspection and connector-confirmed explicit saves.
-- Single-binary DPAPI Windows connector, folder picker, scheduled task, offline-safe reconciliation, log rotation, ZIP and MCPB packaging.
+- Single-binary DPAPI Windows connector, folder picker, upgrade-safe scheduled-task installer, offline-safe reconciliation, log rotation, ZIP and MCPB packaging.
 - Compose deployment/limits/health, backup/restore, unit diagnostics and disposable representative evaluation.
 - Version 0.2.0 repair release: separate lexical/text/visual readiness with provider backfill, per-attempt paid-call accounting from reported usage, locator-owned visual evidence, current-only default search with cross-channel filters, visual cache recovery, and checksum-safe artifact delivery.
 
