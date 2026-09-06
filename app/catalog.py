@@ -143,6 +143,8 @@ def register_upload(
 def complete_reconcile(vault_id: str, source_id: str, generation: int, complete: bool) -> dict[str, int]:
     stamp = now()
     deleted = 0
+    derived_paths: list[Path] = []
+    derived_directories: list[Path] = []
     with connect() as db, transaction(db, immediate=True):
         db.execute(
             """UPDATE sources SET online=?,last_seen_at=?,last_successful_sync_at=CASE WHEN ? THEN ? ELSE last_successful_sync_at END,
@@ -166,12 +168,34 @@ def complete_reconcile(vault_id: str, source_id: str, generation: int, complete:
             (vault_id, source_id, settings().reconcile_delete_confirmations),
         ).fetchall()
         for row in rows:
+            version_ids = [
+                item["id"]
+                for item in db.execute(
+                    "SELECT id FROM versions WHERE vault_id=? AND document_id=?",
+                    (vault_id, row["id"]),
+                ).fetchall()
+            ]
+            derived_directories.extend(settings().preview_dir / vault_id / version_id for version_id in version_ids)
+            derived_paths.extend(
+                Path(item["path"])
+                for item in db.execute(
+                    "SELECT path FROM previews WHERE vault_id=? AND document_id=?",
+                    (vault_id, row["id"]),
+                ).fetchall()
+            )
+            derived_paths.extend(
+                Path(item["raw_staging_path"])
+                for item in db.execute(
+                    "SELECT raw_staging_path FROM versions WHERE vault_id=? AND document_id=? AND raw_staging_path IS NOT NULL",
+                    (vault_id, row["id"]),
+                ).fetchall()
+            )
             db.execute(
                 "UPDATE documents SET state='deleted',availability='deleted',deleted_at=? WHERE vault_id=? AND id=?",
                 (stamp, vault_id, row["id"]),
             )
             db.execute("DELETE FROM chunks_fts WHERE vault_id=? AND document_id=?", (vault_id, row["id"]))
-            db.execute("DELETE FROM chunks WHERE vault_id=? AND document_id=?", (vault_id, row["id"]))
+            db.execute("DELETE FROM versions WHERE vault_id=? AND document_id=?", (vault_id, row["id"]))
             create_job(db, vault_id, "delete_vectors", {"document_id": row["id"]}, priority=20)
             deleted += 1
         db.execute(
@@ -179,6 +203,14 @@ def complete_reconcile(vault_id: str, source_id: str, generation: int, complete:
                AND deleted_at IS NULL AND last_seen_generation=?""",
             (vault_id, source_id, generation),
         )
+    for path in derived_paths:
+        path.unlink(missing_ok=True)
+    for directory in derived_directories:
+        shutil.rmtree(directory, ignore_errors=True)
+    try:
+        (settings().preview_dir / vault_id).rmdir()
+    except OSError:
+        pass
     return {"confirmed_deleted": deleted}
 
 
